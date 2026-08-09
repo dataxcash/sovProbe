@@ -54,12 +54,18 @@ struct SegmentBuf {
     next_expected: u64,
     /// 乱序到达/未达的 Chunk：offset -> bytes
     pending: BTreeMap<u64, Vec<u8>>,
+    /// 插桩：pending 滞留字节数（预算执行依据）
+    pending_bytes: u64,
     /// 已收到封盘信号
     sealed: bool,
     /// 封盘时对账出的缺失字节数
     missing_on_seal: u64,
     records: u64,
     residual: u64,
+    /// 插桩：已实际落位的 chunk 帧数（含顺序写 + pending 回填）
+    placed_chunks: u64,
+    /// 插桩：因 offset<next_expected 被幂等丢弃的帧数（重复到达）
+    dup_dropped: u64,
 }
 
 impl SegmentBuf {
@@ -87,10 +93,13 @@ impl SegmentBuf {
             path,
             next_expected,
             pending: BTreeMap::new(),
+            pending_bytes: 0,
             sealed: false,
             missing_on_seal: 0,
             records: 0,
             residual: 0,
+            placed_chunks: 0,
+            dup_dropped: 0,
         }
     }
 
@@ -109,20 +118,25 @@ impl SegmentBuf {
             return false;
         }
         if offset < self.next_expected {
-            return false; // 已覆盖（重复 / 幂等兜底）
+            self.dup_dropped += 1; // 插桩：已覆盖（重复 / 幂等兜底）
+            return false;
         }
         if offset > self.next_expected {
             // 乱序 / 空洞：暂存，待水位推进后回填
             self.pending.insert(offset, bytes.to_vec());
+            self.pending_bytes += bytes.len() as u64;
             return true;
         }
         // 顺序到达：直接写，随后回填 pending
         self.write_bytes(bytes);
+        self.placed_chunks += 1;
         loop {
             match self.pending.iter().next() {
                 Some((&o, _)) if o == self.next_expected => {
                     let b = self.pending.remove(&o).unwrap();
+                    self.pending_bytes -= b.len() as u64;
                     self.write_bytes(&b);
+                    self.placed_chunks += 1;
                 }
                 _ => break,
             }
@@ -167,10 +181,19 @@ struct Reassembler {
     cache_miss: u64,
     gaps: u64,
     sealed_segments: u64,
+    /// 插桩：每个 (dev_id, segment_seq) 已送达订阅层的 chunk 帧数（解码成功即计）
+    frames_by_segment: HashMap<(u32, u32), u64>,
+    /// 插桩：pending 超预算被逐出的滞留 chunk 数（内存安全网触发计数）
+    pend_dropped: u64,
 }
 
 /// 去重引用物化缓存预算（字节）：超出则逐出最旧，保证接收端内存有界。
 const BLIND_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// pending（乱序/空洞滞留）总字节预算：超出则逐出全局最旧滞留项并记账。
+/// 防止 REF_ONLY 逐出竞态或偶发传输缺口导致 pending 无界增长（实测曾到 448MB+）。
+/// 正常全量数据帧模式下 pending 仅短暂滞留乱序帧，此预算为安全网。
+const PENDING_BUDGET: u64 = 256 * 1024 * 1024;
 
 impl Reassembler {
     fn new(out_dir: PathBuf) -> Self {
@@ -189,6 +212,8 @@ impl Reassembler {
             cache_miss: 0,
             gaps: 0,
             sealed_segments: 0,
+            frames_by_segment: HashMap::new(),
+            pend_dropped: 0,
         }
     }
 
@@ -234,6 +259,10 @@ impl Reassembler {
 
         let blind_id = Self::blind_id_from_key(key);
         self.total_chunks += 1;
+        *self
+            .frames_by_segment
+            .entry((frame.dev_id, frame.segment_seq))
+            .or_insert(0) += 1;
 
         let plaintext: Vec<u8> = if frame.ref_only {
             self.total_refs += 1;
@@ -280,6 +309,35 @@ impl Reassembler {
             .entry(key)
             .or_insert_with(|| SegmentBuf::open(frame.dev_id, frame.segment_seq, &self.out_dir));
         buf.place(frame.start_offset, plaintext);
+        self.enforce_pending_budget();
+    }
+
+    /// pending 总量超出预算时，逐出全局最旧滞留项（最小 offset），直至回落到预算内。
+    /// 逐出的数据段会留下缺口，由封盘 SEAL 对账上报；换取接收端内存有界。
+    fn enforce_pending_budget(&mut self) {
+        while self.pending_total() > PENDING_BUDGET {
+            let victim: Option<(u32, u32)> = self
+                .segments
+                .iter()
+                .filter(|(_, b)| !b.pending.is_empty())
+                .min_by_key(|(_, b)| *b.pending.keys().next().unwrap())
+                .map(|(k, _)| *k);
+            match victim {
+                Some(key) => {
+                    if let Some(buf) = self.segments.get_mut(&key) {
+                        if let Some((_, bytes)) = buf.pending.pop_first() {
+                            buf.pending_bytes -= bytes.len() as u64;
+                            self.pend_dropped += 1;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn pending_total(&self) -> u64 {
+        self.segments.values().map(|b| b.pending_bytes).sum()
     }
 
     /// 处理封盘信号。
@@ -302,15 +360,24 @@ impl Reassembler {
                         seal.sealed_size
                     );
                 }
+                let first_pend_off = buf.pending.keys().next().copied().unwrap_or(0);
+                let pend_gap = first_pend_off.saturating_sub(buf.next_expected);
                 tracing::info!(
-                    "SEAL dev={} seg={} size={} got={} missing={} records={} residual={}",
+                    "SEAL dev={} seg={} size={} got={} missing={} records={} residual={} placed_chunks={} pended_chunks={} pend_bytes={} dup_dropped={} recv_frames={} first_pend_off={} pend_gap={}",
                     seal.dev_id,
                     seal.segment_seq,
                     seal.sealed_size,
                     buf.next_expected,
                     missing,
                     buf.records,
-                    buf.residual
+                    buf.residual,
+                    buf.placed_chunks,
+                    buf.pending.len(),
+                    buf.pending_bytes,
+                    buf.dup_dropped,
+                    self.frames_by_segment.get(&key).copied().unwrap_or(0),
+                    first_pend_off,
+                    pend_gap
                 );
             }
             None => {
@@ -332,7 +399,7 @@ impl Reassembler {
 
     fn stats(&self) -> String {
         format!(
-            "chunks={} refs={} bytes={} unframed={} cache_miss={} gaps={} sealed={} active_segments={} cache_bytes={} evicted={}",
+            "chunks={} refs={} bytes={} unframed={} cache_miss={} gaps={} sealed={} active_segments={} cache_bytes={} evicted={} pend_bytes={} pend_dropped={}",
             self.total_chunks,
             self.total_refs,
             self.total_bytes,
@@ -343,6 +410,8 @@ impl Reassembler {
             self.segments.len(),
             self.blind_cache_bytes,
             self.blind_cache_evicted,
+            self.pending_total(),
+            self.pend_dropped,
         )
     }
 
