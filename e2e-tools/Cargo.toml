@@ -1,0 +1,37 @@
+[package]
+name = "e2e-tools"
+version = "0.1.0"
+edition = "2021"
+description = "M7 E2E 双 VM 压测工具：sub_save_test 接收重组落盘"
+
+[[bin]]
+name = "sub_save_test"
+path = "src/bin/sub_save_test.rs"
+
+[[bin]]
+name = "genwal_distinct"
+path = "src/bin/genwal_distinct.rs"
+
+[[bin]]
+name = "zenoh_pub_enc"
+path = "src/bin/zenoh_pub_enc.rs"
+
+[[bin]]
+name = "zenoh_pub_probe"
+path = "src/bin/zenoh_pub_probe.rs"
+
+[dependencies]
+sov-probe = { path = "../sov-probe" }
+slim-common = { path = "../../slimRAG/slim-common" }
+zenoh = "1.9.0"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+byteorder = "1"
+crc32fast = "1"
+tokio = { version = "1", features = ["full"] }

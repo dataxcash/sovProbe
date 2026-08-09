@@ -1,0 +1,421 @@
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use clap::Parser;
+use slim_common::framing::{
+    decode_chunk_frame, decode_seal_frame, CHUNK_FRAME_HEADER_LEN, ChunkFrame, SealFrame,
+};
+use sov_probe::wal::header::WalRecord;
+use tokio::sync::Mutex;
+
+/// sub_save_test — M7 E2E 接收端测试工具（缺陷 #7 修正版）。
+///
+/// 订阅 slim/sync/chunks/**（数据）与 slim/sync/segments/**（封盘信号）。
+/// 每个 Chunk 帧头部携带 `(dev_id, segment_seq, start_offset)`，接收端按
+/// 段序号分组、按段内绝对 offset 幂等落位重组（不依赖到达顺序，容忍乱序/去重引用），
+/// 封盘信号到达后对该段做三重校验（Magic -> Length -> CRC32）并落盘 segment_XXXX.wal。
+///
+/// 落盘产物为源段原始字节流，可直接与 /dev/shm/sov-probe 源段做 md5 对账。
+#[derive(Parser, Debug)]
+#[command(name = "sub_save_test", version, about)]
+struct Cli {
+    /// Zenoh 数据订阅主题（默认全量 chunks）
+    #[arg(long, default_value = "slim/sync/chunks/**")]
+    topic: String,
+    /// Zenoh 段封盘信号订阅主题
+    #[arg(long, default_value = "slim/sync/segments/**")]
+    seal_topic: String,
+    /// 输出目录（重组后的 WAL 落盘）
+    #[arg(long, default_value = "/data/reassembled")]
+    out: String,
+    /// 32B 解密密钥（hex，与 slimSync key_file 一致）
+    #[arg(long)]
+    key_hex: String,
+    /// 统计周期（秒）
+    #[arg(long, default_value = "5")]
+    stat_secs: u64,
+    /// 监听端点（如 tcp/0.0.0.0:7447），作为 peer/listener 接受连接
+    #[arg(long)]
+    listen: Option<String>,
+}
+
+/// 单个逻辑段的字节重组缓冲：按 offset 幂等落位 + 连续水位推进。
+struct SegmentBuf {
+    file: Option<File>,
+    path: PathBuf,
+    /// 已连续写入字节数（= 文件当前大小，源段追加写 ⇒ 字节流天然连续）
+    next_expected: u64,
+    /// 乱序到达/未达的 Chunk：offset -> bytes
+    pending: BTreeMap<u64, Vec<u8>>,
+    /// 已收到封盘信号
+    sealed: bool,
+    /// 封盘时对账出的缺失字节数
+    missing_on_seal: u64,
+    records: u64,
+    residual: u64,
+}
+
+impl SegmentBuf {
+    fn open(seq: u32, out_dir: &Path) -> Self {
+        let path = out_dir.join(format!("segment_{:04}.wal", seq));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+        // 断点续传：已有文件视为已连续写满，从现有尺寸继续
+        let next_expected = file.as_ref().and_then(|_| path.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+        SegmentBuf {
+            file,
+            path,
+            next_expected,
+            pending: BTreeMap::new(),
+            sealed: false,
+            missing_on_seal: 0,
+            records: 0,
+            residual: 0,
+        }
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(bytes);
+            let _ = f.flush();
+        }
+        self.next_expected += bytes.len() as u64;
+    }
+
+    /// 落位一个 Chunk（按绝对 offset）。返回是否落位成功。
+    fn place(&mut self, offset: u64, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if offset < self.next_expected {
+            return false; // 已覆盖（重复 / 幂等兜底）
+        }
+        if offset > self.next_expected {
+            // 乱序 / 空洞：暂存，待水位推进后回填
+            self.pending.insert(offset, bytes.to_vec());
+            return true;
+        }
+        // 顺序到达：直接写，随后回填 pending
+        self.write_bytes(bytes);
+        loop {
+            match self.pending.iter().next() {
+                Some((&o, _)) if o == self.next_expected => {
+                    let b = self.pending.remove(&o).unwrap();
+                    self.write_bytes(&b);
+                }
+                _ => break,
+            }
+        }
+        true
+    }
+
+    /// 封盘：flush + 三重校验统计。返回缺失字节数。
+    fn on_seal(&mut self, sealed_size: u64) -> u64 {
+        self.sealed = true;
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+        let missing = sealed_size.saturating_sub(self.next_expected);
+        self.missing_on_seal = missing;
+        // 三重校验对账（对账用，不破坏原始字节）
+        if let Ok(bytes) = std::fs::read(&self.path) {
+            let (records, residual) = WalRecord::decode_stream(&bytes);
+            self.records = records.len() as u64;
+            self.residual = residual as u64;
+        }
+        missing
+    }
+}
+
+/// 全局重组器
+struct Reassembler {
+    out_dir: PathBuf,
+    segments: HashMap<u32, SegmentBuf>,
+    /// 去重引用物化缓存：blind_id -> 明文 Chunk 字节
+    blind_cache: HashMap<[u8; 16], Vec<u8>>,
+    total_chunks: u64,
+    total_refs: u64,
+    total_bytes: u64,
+    unframed_dropped: u64,
+    cache_miss: u64,
+    gaps: u64,
+    sealed_segments: u64,
+}
+
+impl Reassembler {
+    fn new(out_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&out_dir).unwrap();
+        Reassembler {
+            out_dir,
+            segments: HashMap::new(),
+            blind_cache: HashMap::new(),
+            total_chunks: 0,
+            total_refs: 0,
+            total_bytes: 0,
+            unframed_dropped: 0,
+            cache_miss: 0,
+            gaps: 0,
+            sealed_segments: 0,
+        }
+    }
+
+    /// 从 topic key 解析 blind_id（最后一段 32 hex）。
+    fn blind_id_from_key(key: &str) -> Option<[u8; 16]> {
+        let hex_str = key.rsplit('/').next().filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        let bytes = hex::decode(hex_str).ok()?;
+        bytes.try_into().ok()
+    }
+
+    /// 处理一个数据/引用帧。
+    fn on_chunk_frame(&mut self, key: &str, payload: Vec<u8>, cipher_key: &[u8; 32]) {
+        let frame = match decode_chunk_frame(&payload) {
+            Some(f) => f,
+            None => {
+                self.unframed_dropped += 1;
+                tracing::warn!("unframed payload dropped (key={})", key);
+                return;
+            }
+        };
+
+        let blind_id = Self::blind_id_from_key(key);
+        self.total_chunks += 1;
+
+        let plaintext: Vec<u8> = if frame.ref_only {
+            self.total_refs += 1;
+            match blind_id.and_then(|id| self.blind_cache.get(&id).cloned()) {
+                Some(b) => b,
+                None => {
+                    self.cache_miss += 1;
+                    tracing::warn!("REF_ONLY frame with missing blind cache (key={})", key);
+                    return;
+                }
+            }
+        } else {
+            let cipher = &payload[CHUNK_FRAME_HEADER_LEN..];
+            match decrypt(cipher_key, cipher) {
+                Some(p) => {
+                    if let Some(id) = blind_id {
+                        self.blind_cache.insert(id, p.clone());
+                    }
+                    p
+                }
+                None => {
+                    tracing::warn!("decrypt failed / malformed chunk (key={})", key);
+                    return;
+                }
+            }
+        };
+
+        if (plaintext.len() as u32) != frame.chunk_len {
+            tracing::warn!(
+                "chunk len mismatch: header={} actual={} (key={})",
+                frame.chunk_len,
+                plaintext.len(),
+                key
+            );
+        }
+        self.place(frame, &plaintext);
+    }
+
+    fn place(&mut self, frame: ChunkFrame, plaintext: &[u8]) {
+        self.total_bytes += plaintext.len() as u64;
+        let buf = self
+            .segments
+            .entry(frame.segment_seq)
+            .or_insert_with(|| SegmentBuf::open(frame.segment_seq, &self.out_dir));
+        buf.place(frame.start_offset, plaintext);
+    }
+
+    /// 处理封盘信号。
+    fn on_seal_frame(&mut self, seal: SealFrame) {
+        self.sealed_segments += 1;
+        match self.segments.get_mut(&seal.segment_seq) {
+            Some(buf) => {
+                let missing = buf.on_seal(seal.sealed_size);
+                if missing > 0 {
+                    self.gaps += 1;
+                }
+                tracing::info!(
+                    "SEAL seg={} size={} got={} missing={} records={} residual={}",
+                    seal.segment_seq,
+                    seal.sealed_size,
+                    buf.next_expected,
+                    missing,
+                    buf.records,
+                    buf.residual
+                );
+            }
+            None => {
+                // 从未收到该段任何 Chunk 的封盘信号：仅记账，不落盘空文件
+                tracing::warn!(
+                    "SEAL for unknown segment {} (size={}) — 该段数据未到达",
+                    seal.segment_seq,
+                    seal.sealed_size
+                );
+            }
+        }
+    }
+
+    /// 回答 EXISTS 盲去重查询：仅当字节已在本地缓存时才回 "true"。
+    fn has_blind(&self, blind_id: [u8; 16]) -> bool {
+        self.blind_cache.contains_key(&blind_id)
+    }
+
+    fn stats(&self) -> String {
+        format!(
+            "chunks={} refs={} bytes={} unframed={} cache_miss={} gaps={} sealed={} active_segments={}",
+            self.total_chunks,
+            self.total_refs,
+            self.total_bytes,
+            self.unframed_dropped,
+            self.cache_miss,
+            self.gaps,
+            self.sealed_segments,
+            self.segments.len()
+        )
+    }
+
+    fn flush_all(&mut self) {
+        for buf in self.segments.values_mut() {
+            if let Some(f) = buf.file.as_mut() {
+                let _ = f.flush();
+            }
+        }
+        tracing::info!("shutdown: {}", self.stats());
+    }
+}
+
+fn decrypt(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 12 {
+        return None;
+    }
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let mut plaintext = ciphertext.to_vec();
+    cipher
+        .decrypt_in_place(nonce, &[], &mut plaintext)
+        .ok()?;
+    Some(plaintext)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 默认 info 级日志（兼容 RUST_LOG 覆盖），避免未设环境变量时日志静默
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let cli = Cli::parse();
+
+    let key_bytes = hex::decode(&cli.key_hex)?;
+    if key_bytes.len() != 32 {
+        anyhow::bail!("key_hex 必须为 32 字节（64 hex 字符）");
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+
+    let mut zcfg = zenoh::Config::default();
+    if let Some(ep) = &cli.listen {
+        let _ = zcfg.insert_json5("listen/endpoints", &format!("[\"{}\"]", ep));
+        tracing::info!("zenoh listen: {ep}");
+    }
+    let session = zenoh::open(zcfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("zenoh open: {e}"))?;
+
+    let reassembler = Arc::new(Mutex::new(Reassembler::new(PathBuf::from(&cli.out))));
+    let out_dir = PathBuf::from(&cli.out);
+
+    // ── 数据订阅 ──
+    let sub_reassembler = reassembler.clone();
+    let sub = session
+        .declare_subscriber(&cli.topic)
+        .await
+        .map_err(|e| anyhow::anyhow!("declare_subscriber {}: {e}", cli.topic))?;
+    tracing::info!("subscribed: {} -> {}", cli.topic, out_dir.display());
+    let data_key = key;
+    tokio::spawn(async move {
+        while let Ok(sample) = sub.recv_async().await {
+            let key_expr = sample.key_expr().to_string();
+            let payload: Vec<u8> = sample.payload().to_bytes().into();
+            let mut r = sub_reassembler.lock().await;
+            r.on_chunk_frame(&key_expr, payload, &data_key);
+        }
+    });
+
+    // ── 封盘信号订阅 ──
+    let seal_reassembler = reassembler.clone();
+    let seal_sub = session
+        .declare_subscriber(&cli.seal_topic)
+        .await
+        .map_err(|e| anyhow::anyhow!("declare_subscriber {}: {e}", cli.seal_topic))?;
+    tracing::info!("subscribed: {}", cli.seal_topic);
+    tokio::spawn(async move {
+        while let Ok(sample) = seal_sub.recv_async().await {
+            let payload: Vec<u8> = sample.payload().to_bytes().into();
+            if let Some(seal) = decode_seal_frame(&payload) {
+                let mut r = seal_reassembler.lock().await;
+                r.on_seal_frame(seal);
+            }
+        }
+    });
+
+    // ── 盲去重 EXISTS 查询应答（支持 slimSync 去重引用帧） ──
+    let exists_reassembler = reassembler.clone();
+    let queryable = session
+        .declare_queryable(&format!("{}/**", slim_common::topics::EXISTS))
+        .await
+        .map_err(|e| anyhow::anyhow!("declare_queryable: {e}"))?;
+    tracing::info!("queryable: {}", slim_common::topics::EXISTS);
+    tokio::spawn(async move {
+        while let Ok(query) = queryable.recv_async().await {
+            let key = query.key_expr().to_string();
+            if let Some(id) = Reassembler::blind_id_from_key(&key) {
+                let exists = {
+                    let r = exists_reassembler.lock().await;
+                    r.has_blind(id)
+                };
+                let reply = if exists { "true".to_string() } else { "false".to_string() };
+                // ReplyBuilder 必须 .await 才会真正发送应答
+                let _ = query.reply(query.key_expr().clone(), reply.as_bytes()).await;
+            }
+        }
+    });
+
+    // ── 周期统计 ──
+    let stat_interval = Duration::from_secs(cli.stat_secs);
+    let stat_reassembler = reassembler.clone();
+    let stat_task = tokio::spawn(async move {
+        let mut last = Instant::now();
+        loop {
+            tokio::time::sleep(stat_interval).await;
+            let r = stat_reassembler.lock().await;
+            let per_sec = {
+                let now = Instant::now();
+                let dt = now.duration_since(last).as_secs_f64().max(1e-9);
+                last = now;
+                r.total_bytes as f64 / dt
+            };
+            tracing::info!("STAT {} rate={:.0}B/s", r.stats(), per_sec);
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("ctrl-c received, finalizing...");
+    stat_task.abort();
+    {
+        let mut r = reassembler.lock().await;
+        r.flush_all();
+    }
+    Ok(())
+}

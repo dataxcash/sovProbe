@@ -58,37 +58,59 @@ impl Capture {
     /// 阻塞消费 RingBuffer：Slicer 解析 → crossbeam 队列。
     /// 热路径熔断：队列深度超水位时直接丢弃新帧（Drop-Tail，Fail-Open）。
     /// bpf 在此函数生命周期内保持存活（borrow 约束）。
+    ///
+    /// aya 的 `RingBuf::next()` 是非阻塞轮询（空时返回 None），
+    /// 必须用 epoll/poll 阻塞等待数据就绪后再批量消费，否则消费线程
+    /// 启动即退出、再无消费者（捕获为 0 的致命缺陷）。
     pub fn consume(
         &mut self,
         tx: Sender<crate::wal::header::WalRecord>,
         slice_bytes: usize,
         breaker: &Breaker,
     ) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+
         let mut ring: RingBuf<_> = RingBuf::try_from(
             self.bpf
                 .map_mut("events")
                 .ok_or_else(|| anyhow::anyhow!("events map 不存在"))?,
         )?;
         let slicer = crate::parse::slicer::Slicer::new(slice_bytes);
-        while let Some(item) = ring.next() {
-            // 热路径熔断检查：degraded 时丢弃，不进入解析/WAL
-            if breaker.is_degraded() {
-                breaker.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        loop {
+            // 阻塞等待 ringbuf fd 可读
+            let mut fds = [libc::pollfd {
+                fd: ring.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+            if rc < 0 {
+                return Err(anyhow::anyhow!("poll ringbuf fd 失败: {}", std::io::Error::last_os_error()));
+            }
+            if rc == 0 || fds[0].revents & libc::POLLIN == 0 {
                 continue;
             }
-            let ts_ns: u64 = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .try_into()
-                .unwrap_or(0);
-            if let Some(rec) = slicer.process(item.as_ref(), ts_ns, breaker.is_degraded()) {
-                if tx.send(rec).is_err() {
-                    break; // 下游关闭
+
+            // 批量消费当前可读数据
+            while let Some(item) = ring.next() {
+                // 热路径熔断检查：degraded 时丢弃，不进入解析/WAL
+                if breaker.is_degraded() {
+                    breaker.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                let ts_ns: u64 = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .try_into()
+                    .unwrap_or(0);
+                if let Some(rec) = slicer.process(item.as_ref(), ts_ns, breaker.is_degraded()) {
+                    if tx.send(rec).is_err() {
+                        return Ok(()); // 下游关闭，正常退出
+                    }
                 }
             }
         }
-        info!("ringbuf 消费结束");
-        Ok(())
     }
 }
