@@ -73,23 +73,29 @@ sovprobe_degraded_now
 sovprobe_slicer_dropped_total
 ```
 
-## WAL 64B 契约（v0.2）
+## WAL 64B 契约（v0.3）
 
 ```
-Offset  Size  Field        Type
-0       8     timestamp_ns u64 大端
-8       8     flags        u64 (bit0=degraded, bit1=truncated, bit2=is_ipv6)
-16      16    src_ip       [u8;16] IPv4 高12B=0 低4B=大端
-32      16    dst_ip       [u8;16] 同上
-48      2     src_port     u16
-50      2     dst_port     u16
-52      2     proto        u16 (6=TCP,17=UDP)
-54      4     payload_len  u32
-58      6     reserved     [u8;6]
+Offset  Size  Field             Type
+0       2     magic             u16 = 0x5350 ("SP")
+2       1     version           u8 = 0x03
+3       1     tcp_flags         u8 (FIN/SYN/RST/PSH/ACK/URG)
+4       4     crc32             u32 (覆盖 header 除 crc32 字段全部 + payload)
+8       8     timestamp_ns      u64 大端
+16      16    src_ip            [u8;16] IPv4 高12B=0 低4B=大端
+32      16    dst_ip            [u8;16] 同上
+48      2     src_port          u16
+50      2     dst_port          u16
+52      1     proto             u8 (6=TCP,17=UDP)
+53      3     reserved_pad      [u8;3] bit0=DEGRADED bit1=IS_IPV6
+56      4     payload_len       u32 (incl_len，裁切后)
+60      4     orig_payload_len  u32 (orig_len，线上原始)
 ───────────────────────────
 64 字节 header + payload 原样
 ```
 
+- **三重完整性校验**（Magic → Length → CRC32）：任一失败即丢弃脏尾，杜绝静默吃坏包。
+- **TRUNCATED** 由 `orig_payload_len > payload_len` 推导；sov2pcap 据此映射 `orig_len > incl_len`，Wireshark 精准提示 snaplen truncated。
 - 定长 64B 缓存行对齐；SovVault 端按 `pos += 64 + payload_len` 精确遍历。
 - FastCDC 切块边界不对齐记录边界，**SovVault 必须做流式字节重组**（Stream Reassembly）。
 

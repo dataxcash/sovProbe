@@ -70,8 +70,12 @@ fn main() -> anyhow::Result<()> {
             }
             let packet = synthesize(rec);
             let ts = Duration::from_nanos(rec.timestamp_ns);
-            let orig_len = packet.len() as u32;
-            writer.write_packet(&PcapPacket::new(ts, orig_len, &packet))?;
+            // incl_len = 实际落盘字节（packet.len()）
+            // orig_len = orig_payload_len + L2(14) + L3(20/40) + L4(20/8)
+            let l3_len = if rec.flags & FLAG_IS_IPV6 != 0 { 40 } else { 20 };
+            let l4_len = if rec.proto == 6 { 20 } else { 8 };
+            let orig_len = 14 + l3_len + l4_len + rec.orig_payload_len as usize;
+            writer.write_packet(&PcapPacket::new(ts, orig_len as u32, &packet))?;
             n += 1;
         }
         drop(writer);
@@ -133,10 +137,12 @@ fn synthesize(rec: &WalRecord) -> Vec<u8> {
     let (sp_hi, sp_lo) = ((rec.src_port >> 8) as u8, (rec.src_port & 0xFF) as u8);
     let (dp_hi, dp_lo) = ((rec.dst_port >> 8) as u8, (rec.dst_port & 0xFF) as u8);
     if rec.proto == 6 {
+        // flags 字节 = 保留位(0) + 8 位 flags。我们的 u8 掩码即 TCP 头 byte13 的 flags 域。
+        let flags = rec.tcp_flags;
         out.extend_from_slice(&[
-            sp_hi, sp_lo, dp_hi, dp_lo, 0, 0, 0, 0, // seq
-            0, 0, 0, 0, // ack
-            0x50, 0x18, 0xFF, 0xFF, 0, 0, 0, 0, // hlen/flags/window/checksum/urg
+            sp_hi, sp_lo, dp_hi, dp_lo, 0, 0, 0, 0, // seq(合成)
+            0, 0, 0, 0, // ack(合成)
+            0x50, flags, 0xFF, 0xFF, 0, 0, 0, 0, // hlen/dataoffset + flags/window/checksum/urg
         ]);
     } else {
         let ulen = ((8 + rec.payload.len()) as u16).to_be_bytes();

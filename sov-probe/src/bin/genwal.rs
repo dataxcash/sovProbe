@@ -8,19 +8,22 @@ fn main() -> anyhow::Result<()> {
     let path = format!("{}/segment_0000.wal", dir);
     let mut buf = Vec::new();
     for i in 0..50u32 {
+        let payload = format!(
+            "GET /api/orders/{} HTTP/1.1\r\nHost: api.example.com\r\n",
+            i
+        )
+        .into_bytes();
         let rec = WalRecord {
             timestamp_ns: 1_700_000_000_000 + i as u64,
             flags: 0,
+            tcp_flags: 0x02, // SYN
             src_ip: encode_ip(Some([192, 168, 1, 10]), None).0,
             dst_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
             src_port: 12345,
             dst_port: 443,
             proto: 6,
-            payload: format!(
-                "GET /api/orders/{} HTTP/1.1\r\nHost: api.example.com\r\n",
-                i
-            )
-            .into_bytes(),
+            orig_payload_len: payload.len() as u32,
+            payload,
         };
         rec.encode(&mut buf);
     }

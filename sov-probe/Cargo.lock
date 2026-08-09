@@ -696,6 +696,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "clap",
+ "crc32fast",
  "crossbeam-channel",
  "etherparse",
  "hex",

@@ -41,6 +41,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 字节工具
 byteorder = "1"
 hex = "0.4"
+crc32fast = "1"
 
 # sov2pcap 转码：标准 PCAP 写入
 pcap-file = "2"
