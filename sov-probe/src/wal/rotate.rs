@@ -27,12 +27,36 @@ impl Rotator {
         anyhow::ensure!(max_segments >= 1, "max_segments >= 1");
         let path = PathBuf::from(shm_path);
         fs::create_dir_all(&path)?;
+        // 重启健壮性：已有 segment_*.wal 时从最大段号+1 续起，绝不复用文件名
+        // （段号单调递增契约，避免 create_new 撞现存文件而崩溃）。
+        let (seg_no, min_no) = Self::scan_existing(&path);
         Ok(Self {
             shm_path: path,
             max_segments,
-            seg_no: 0,
-            min_no: 0,
+            seg_no,
+            min_no,
         })
+    }
+
+    /// 扫描目录内现有 segment_XXXX.wal，返回 (下一个可用段号, 现存最小段号)。
+    fn scan_existing(path: &Path) -> (u64, u64) {
+        let mut max = None;
+        let mut min = None;
+        if let Ok(rd) = fs::read_dir(path) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if let Some(stripped) = name
+                    .strip_prefix("segment_")
+                    .and_then(|s| s.strip_suffix(".wal"))
+                {
+                    if let Ok(no) = stripped.parse::<u64>() {
+                        max = Some(max.map_or(no, |m: u64| m.max(no)));
+                        min = Some(min.map_or(no, |m: u64| m.min(no)));
+                    }
+                }
+            }
+        }
+        (max.map_or(0, |m| m + 1), min.unwrap_or(0))
     }
 
     /// 段路径：序号直接作为文件名，单向递增，全局唯一。
@@ -195,6 +219,23 @@ mod tests {
         assert_eq!(r.existing_count(), 2);
         // 最旧的 0000/0001/0002 已删，现存为 0003/0004
         assert!(r.min_existing_no() >= 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_skips_existing_segments() {
+        let dir = "/tmp/sovprobe_test_restart";
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).unwrap();
+        fs::write(format!("{}/segment_0003.wal", dir), b"a").unwrap();
+        fs::write(format!("{}/segment_0007.wal", dir), b"b").unwrap();
+        let (next, min) = Rotator::scan_existing(Path::new(dir));
+        assert_eq!(next, 8, "应从最大段号+1 续起");
+        assert_eq!(min, 3, "现存最小段号 3");
+        // 完整流程：新分配段号不得撞现存文件
+        let mut r = Rotator::new(dir, 8).unwrap();
+        let p = r.next_segment().unwrap();
+        assert!(p.ends_with("segment_0008.wal"), "新段应跳过已有段号");
         let _ = fs::remove_dir_all(dir);
     }
 }

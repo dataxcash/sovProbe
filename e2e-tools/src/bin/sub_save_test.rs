@@ -97,7 +97,8 @@ impl SegmentBuf {
     fn write_bytes(&mut self, bytes: &[u8]) {
         if let Some(f) = self.file.as_mut() {
             let _ = f.write_all(bytes);
-            let _ = f.flush();
+            // 性能：不在每个 chunk 上 fsync（高吞吐下 3000+/s 的 flush 是消费端最大瓶颈），
+            // 数据由 OS page cache 承载，封盘/退出时统一 flush。
         }
         self.next_expected += bytes.len() as u64;
     }
@@ -257,6 +258,16 @@ impl Reassembler {
                 let missing = buf.on_seal(seal.sealed_size);
                 if missing > 0 {
                     self.gaps += 1;
+                }
+                if buf.next_expected > seal.sealed_size {
+                    // 现有文件比封盘声明的尺寸还大 → 疑似旧会话残留文件污染（断点续传误续水位）
+                    tracing::warn!(
+                        "SEAL dev={} seg={} 现有文件({}B) 大于封盘尺寸({}B)——疑为残留旧文件，需清空 out 目录重跑",
+                        seal.dev_id,
+                        seal.segment_seq,
+                        buf.next_expected,
+                        seal.sealed_size
+                    );
                 }
                 tracing::info!(
                     "SEAL dev={} seg={} size={} got={} missing={} records={} residual={}",
