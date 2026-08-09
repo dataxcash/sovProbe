@@ -1,6 +1,7 @@
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::Parser;
+use slim_common::framing::encode_chunk_frame;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -10,6 +11,15 @@ struct Cli {
     key_hex: String,
     #[arg(long)]
     plain: String,
+    /// 段号（默认 0）
+    #[arg(long, default_value_t = 0)]
+    segment_seq: u32,
+    /// 段内起始偏移（默认 0）
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    /// 探针设备 ID（默认 1）
+    #[arg(long, default_value_t = 1)]
+    dev_id: u32,
 }
 
 #[tokio::main]
@@ -25,17 +35,29 @@ async fn main() {
         *b = (i as u8).wrapping_add(1);
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let mut plaintext = cli.plain.into_bytes();
+    let plain_len = cli.plain.len() as u32;
+    let mut ciphertext = cli.plain.into_bytes();
     cipher
-        .encrypt_in_place(nonce, &[], &mut plaintext)
+        .encrypt_in_place(nonce, &[], &mut ciphertext)
         .unwrap();
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&nonce_bytes);
-    payload.extend_from_slice(&plaintext);
+
+    // 缺陷 #7 契约：帧负载 = nonce(12) + ChaCha20 密文；头部携带
+    // (dev_id, segment_seq, start_offset)，否则 sub_save_test 视为 unframed 丢弃。
+    let mut sealed = Vec::with_capacity(12 + ciphertext.len());
+    sealed.extend_from_slice(&nonce_bytes);
+    sealed.extend_from_slice(&ciphertext);
+    let frame = encode_chunk_frame(cli.dev_id, cli.segment_seq, cli.offset, plain_len, &sealed, false);
 
     let session = zenoh::open(zenoh::Config::default()).await.unwrap();
     println!("pub enc session open");
-    session.put(&cli.topic, &payload).await.unwrap();
-    println!("put enc OK: {} ({} bytes)", cli.topic, payload.len());
+    session.put(&cli.topic, &frame).await.unwrap();
+    println!(
+        "put enc OK: {} ({} bytes, dev={} seg={} off={})",
+        cli.topic,
+        frame.len(),
+        cli.dev_id,
+        cli.segment_seq,
+        cli.offset
+    );
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 }

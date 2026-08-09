@@ -63,8 +63,18 @@ struct SegmentBuf {
 }
 
 impl SegmentBuf {
-    fn open(seq: u32, out_dir: &Path) -> Self {
-        let path = out_dir.join(format!("segment_{:04}.wal", seq));
+    /// dev_id==1 保持 `segment_XXXX.wal`（M7 单探针对账契约）；
+    /// 多探针（dev_id!=1）使用 `dev{dev_id}_segment_XXXX.wal` 隔离，避免串段。
+    fn seg_path(dev_id: u32, seq: u32, out_dir: &Path) -> PathBuf {
+        if dev_id == 1 {
+            out_dir.join(format!("segment_{:04}.wal", seq))
+        } else {
+            out_dir.join(format!("dev{}_segment_{:04}.wal", dev_id, seq))
+        }
+    }
+
+    fn open(dev_id: u32, seq: u32, out_dir: &Path) -> Self {
+        let path = Self::seg_path(dev_id, seq, out_dir);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -140,7 +150,8 @@ impl SegmentBuf {
 /// 全局重组器
 struct Reassembler {
     out_dir: PathBuf,
-    segments: HashMap<u32, SegmentBuf>,
+    /// 按 (dev_id, segment_seq) 分组，多探针隔离不串段
+    segments: HashMap<(u32, u32), SegmentBuf>,
     /// 去重引用物化缓存：blind_id -> 明文 Chunk 字节
     blind_cache: HashMap<[u8; 16], Vec<u8>>,
     total_chunks: u64,
@@ -229,24 +240,27 @@ impl Reassembler {
 
     fn place(&mut self, frame: ChunkFrame, plaintext: &[u8]) {
         self.total_bytes += plaintext.len() as u64;
+        let key = (frame.dev_id, frame.segment_seq);
         let buf = self
             .segments
-            .entry(frame.segment_seq)
-            .or_insert_with(|| SegmentBuf::open(frame.segment_seq, &self.out_dir));
+            .entry(key)
+            .or_insert_with(|| SegmentBuf::open(frame.dev_id, frame.segment_seq, &self.out_dir));
         buf.place(frame.start_offset, plaintext);
     }
 
     /// 处理封盘信号。
     fn on_seal_frame(&mut self, seal: SealFrame) {
         self.sealed_segments += 1;
-        match self.segments.get_mut(&seal.segment_seq) {
+        let key = (seal.dev_id, seal.segment_seq);
+        match self.segments.get_mut(&key) {
             Some(buf) => {
                 let missing = buf.on_seal(seal.sealed_size);
                 if missing > 0 {
                     self.gaps += 1;
                 }
                 tracing::info!(
-                    "SEAL seg={} size={} got={} missing={} records={} residual={}",
+                    "SEAL dev={} seg={} size={} got={} missing={} records={} residual={}",
+                    seal.dev_id,
                     seal.segment_seq,
                     seal.sealed_size,
                     buf.next_expected,
@@ -258,7 +272,8 @@ impl Reassembler {
             None => {
                 // 从未收到该段任何 Chunk 的封盘信号：仅记账，不落盘空文件
                 tracing::warn!(
-                    "SEAL for unknown segment {} (size={}) — 该段数据未到达",
+                    "SEAL for unknown dev={} seg={} (size={}) — 该段数据未到达",
+                    seal.dev_id,
                     seal.segment_seq,
                     seal.sealed_size
                 );
@@ -487,7 +502,7 @@ mod tests {
         r.on_chunk_frame(&blind_key(b"bbbbbbbbbbbbbbbb"), frame(0, 0, b"prefix"), &key());
         let bytes = std::fs::read(dir.join("segment_0000.wal")).unwrap();
         assert_eq!(bytes, b"prefixdata");
-        assert!(r.segments[&0].pending.is_empty(), "pending 应已清空");
+        assert!(r.segments[&(1, 0)].pending.is_empty(), "pending 应已清空");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -498,7 +513,7 @@ mod tests {
         let mut r = Reassembler::new(dir.clone());
         r.on_chunk_frame(&blind_key(b"cccccccccccccccc"), frame(2, 0, b"0123456789"), &key());
         r.on_seal_frame(SealFrame { dev_id: 1, segment_seq: 2, sealed_size: 25 });
-        assert_eq!(r.segments[&2].missing_on_seal, 15, "应报缺失 15 字节");
+        assert_eq!(r.segments[&(1, 2)].missing_on_seal, 15, "应报缺失 15 字节");
         assert_eq!(r.gaps, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -535,7 +550,7 @@ mod tests {
         assert_eq!(r.gaps, 0);
         let out = std::fs::read(dir.join("segment_0001.wal")).unwrap();
         assert_eq!(out, wal, "重组字节应与源 WAL 完全一致");
-        let buf = r.segments.get(&seg).unwrap();
+        let buf = r.segments.get(&(1, seg)).unwrap();
         assert_eq!(buf.records, 3);
         assert_eq!(buf.residual, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -571,5 +586,30 @@ mod tests {
         assert_eq!(seal.dev_id, 7);
         assert_eq!(seal.segment_seq, 42);
         assert_eq!(seal.sealed_size, 65536);
+    }
+
+    /// 多探针隔离：dev_id=1 与 dev_id=2 同段号不得串段（各自独立落盘）。
+    #[test]
+    fn dev_id_isolation() {
+        let dir = tmp_out("dev");
+        let mut r = Reassembler::new(dir.clone());
+        // dev1 seg0
+        r.on_chunk_frame(
+            &blind_key(b"aaaaaaaaaaaaaaaa"),
+            encode_chunk_frame(1, 0, 0, 4, &enc(b"dev1"), false),
+            &key(),
+        );
+        // dev2 seg0（同段号，不同探针）
+        r.on_chunk_frame(
+            &blind_key(b"bbbbbbbbbbbbbbbb"),
+            encode_chunk_frame(2, 0, 0, 4, &enc(b"dev2"), false),
+            &key(),
+        );
+        let dev1 = std::fs::read(dir.join("segment_0000.wal")).unwrap();
+        let dev2 = std::fs::read(dir.join("dev2_segment_0000.wal")).unwrap();
+        assert_eq!(dev1, b"dev1");
+        assert_eq!(dev2, b"dev2");
+        assert_eq!(r.segments.len(), 2, "两探针必须独立分组");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
