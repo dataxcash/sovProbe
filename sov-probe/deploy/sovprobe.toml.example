@@ -1,0 +1,14 @@
+# sovProbe 默认配置（/etc/sovprobe.toml）
+interfaces = ["eth0"]
+capture_ports = [80, 443, 8080, 5432]
+slice_bytes = 4096
+segment_size = 67108864
+rotate_interval_secs = 5
+max_segments = 8
+queue_capacity = 100000
+queue_high_watermark = 80
+cpu_limit_pct = 2.0
+ram_limit_mb = 64
+host_cpu_limit_pct = 85
+shm_path = "/dev/shm/sov-probe"
+metrics_addr = "0.0.0.0:9101"

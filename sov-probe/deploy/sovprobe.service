@@ -1,0 +1,23 @@
+[Unit]
+Description=IronSovereign sovProbe - 零拷贝旁路网络探针
+Documentation=https://github.com/dataxcash/sov-probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sovprobe --config /etc/sovprobe.toml
+Restart=on-failure
+RestartSec=3
+# 最小权限：仅需 CAP_NET_ADMIN + CAP_BPF，禁用 root shell
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# /dev/shm 探针输出目录（slimSync 同机消费）
+ReadWritePaths=/dev/shm/sov-probe
+
+[Install]
+WantedBy=multi-user.target
