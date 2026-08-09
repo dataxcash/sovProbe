@@ -419,3 +419,157 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slim_common::framing::{encode_chunk_frame, encode_seal_frame};
+
+    fn tmp_out(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sub_save_test_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn key() -> [u8; 32] {
+        [0x11; 32]
+    }
+
+    /// 加密（nonce 固定 + ChaCha20），与生产 decrypt 对称。
+    fn enc(data: &[u8]) -> Vec<u8> {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key()));
+        let mut nonce = [0u8; 12];
+        for (i, b) in nonce.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut ct = data.to_vec();
+        cipher.encrypt_in_place(Nonce::from_slice(&nonce), &[], &mut ct).unwrap();
+        [nonce.as_slice(), ct.as_slice()].concat()
+    }
+
+    fn frame(seg: u32, offset: u64, data: &[u8]) -> Vec<u8> {
+        encode_chunk_frame(1, seg, offset, data.len() as u32, &enc(data), false)
+    }
+
+    fn blind_key(prefix: &[u8; 16]) -> String {
+        format!("slim/sync/chunks/{}", hex::encode(prefix))
+    }
+
+    /// 顺序落位 + 乱序落位（offset 先大后小）→ 字节流按 offset 正确重组。
+    #[test]
+    fn place_in_order_and_out_of_order() {
+        let dir = tmp_out("order");
+        let mut r = Reassembler::new(dir.clone());
+        // 乱序：先到 offset 5 的块（比 0 大，进 pending）
+        r.on_chunk_frame(
+            &blind_key(b"aaaaaaaaaaaaaaaa"),
+            frame(3, 5, b"world"),
+            &key(),
+        );
+        // 顺序：offset 0 → 触发回填 offset 5
+        r.on_chunk_frame(&blind_key(b"bbbbbbbbbbbbbbbb"), frame(3, 0, b"hello"), &key());
+        // 去重幂等：重复 offset 0
+        r.on_chunk_frame(&blind_key(b"bbbbbbbbbbbbbbbb"), frame(3, 0, b"hello"), &key());
+        let bytes = std::fs::read(dir.join("segment_0003.wal")).unwrap();
+        assert_eq!(bytes, b"helloworld");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 乱序块：到达时 offset > 水位 → 暂存，水位推进后回填；文件字节完整。
+    #[test]
+    fn out_of_order_backfill() {
+        let dir = tmp_out("backfill");
+        let mut r = Reassembler::new(dir.clone());
+        // 先来 offset=6 的块（应进 pending）
+        r.on_chunk_frame(&blind_key(b"aaaaaaaaaaaaaaaa"), frame(0, 6, b"data"), &key());
+        // 再来 offset=0..6 的块 → 触发回填
+        r.on_chunk_frame(&blind_key(b"bbbbbbbbbbbbbbbb"), frame(0, 0, b"prefix"), &key());
+        let bytes = std::fs::read(dir.join("segment_0000.wal")).unwrap();
+        assert_eq!(bytes, b"prefixdata");
+        assert!(r.segments[&0].pending.is_empty(), "pending 应已清空");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 封盘缺失对账：空洞未填 → 报缺失字节数。
+    #[test]
+    fn seal_reports_missing_gap() {
+        let dir = tmp_out("gap");
+        let mut r = Reassembler::new(dir.clone());
+        r.on_chunk_frame(&blind_key(b"cccccccccccccccc"), frame(2, 0, b"0123456789"), &key());
+        r.on_seal_frame(SealFrame { dev_id: 1, segment_seq: 2, sealed_size: 25 });
+        assert_eq!(r.segments[&2].missing_on_seal, 15, "应报缺失 15 字节");
+        assert_eq!(r.gaps, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 封盘三重校验对账：完整 WAL 段 → records 数正确、residual=0。
+    #[test]
+    fn seal_counts_records() {
+        use sov_probe::wal::header::{encode_ip, WalRecord, TCP_ACK};
+        let dir = tmp_out("records");
+        let mut r = Reassembler::new(dir.clone());
+        let mut wal = Vec::new();
+        for i in 0..3u32 {
+            let rec = WalRecord {
+                timestamp_ns: 1_700_000_000_000 + i as u64,
+                flags: 0,
+                tcp_flags: TCP_ACK,
+                src_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
+                dst_ip: encode_ip(Some([10, 0, 0, 2]), None).0,
+                src_port: 1000,
+                dst_port: 8080,
+                proto: 6,
+                orig_payload_len: 4,
+                payload: b"req!".to_vec(),
+            };
+            rec.encode(&mut wal);
+        }
+        let seg = 1u32;
+        let third = wal.len() / 3;
+        // 乱序 3 块发布（2/3 处 → 0 → 1/3 处），验证按 offset 重组后解码正确
+        r.on_chunk_frame(&blind_key(b"aaaaaaaaaaaaaaaa"), frame(seg, (third * 2) as u64, &wal[third * 2..]), &key());
+        r.on_chunk_frame(&blind_key(b"bbbbbbbbbbbbbbbb"), frame(seg, 0, &wal[..third]), &key());
+        r.on_chunk_frame(&blind_key(b"cccccccccccccccc"), frame(seg, third as u64, &wal[third..third * 2]), &key());
+        r.on_seal_frame(SealFrame { dev_id: 1, segment_seq: seg, sealed_size: wal.len() as u64 });
+        assert_eq!(r.gaps, 0);
+        let out = std::fs::read(dir.join("segment_0001.wal")).unwrap();
+        assert_eq!(out, wal, "重组字节应与源 WAL 完全一致");
+        let buf = r.segments.get(&seg).unwrap();
+        assert_eq!(buf.records, 3);
+        assert_eq!(buf.residual, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 去重引用帧：数据帧先进缓存 → 引用帧物化成功；缺缓存 → cache_miss 计数。
+    #[test]
+    fn ref_only_materialization() {
+        let dir = tmp_out("ref");
+        let mut r = Reassembler::new(dir.clone());
+        let key_expr = format!("slim/sync/chunks/{}", hex::encode([0xdd; 16]));
+        // 先发数据帧（入缓存 + 落位）
+        r.on_chunk_frame(&key_expr, frame(5, 0, b"secret"), &key());
+        // 引用帧（另一 segment 复用）→ 从缓存物化
+        r.on_chunk_frame(&key_expr, encode_chunk_frame(1, 6, 0, 6, b"", true), &key());
+        let seg5 = std::fs::read(dir.join("segment_0005.wal")).unwrap();
+        let seg6 = std::fs::read(dir.join("segment_0006.wal")).unwrap();
+        assert_eq!(seg5, b"secret");
+        assert_eq!(seg6, b"secret");
+        assert_eq!(r.total_refs, 1);
+        assert_eq!(r.cache_miss, 0);
+        // 未知 blind_id 的引用帧 → cache_miss
+        let miss_key = format!("slim/sync/chunks/{}", hex::encode([0xee; 16]));
+        r.on_chunk_frame(&miss_key, encode_chunk_frame(1, 7, 0, 6, b"", true), &key());
+        assert_eq!(r.cache_miss, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seal_frame_parse_roundtrip() {
+        let framed = encode_seal_frame(7, 42, 65536);
+        let seal = decode_seal_frame(&framed).unwrap();
+        assert_eq!(seal.dev_id, 7);
+        assert_eq!(seal.segment_seq, 42);
+        assert_eq!(seal.sealed_size, 65536);
+    }
+}
