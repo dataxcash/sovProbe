@@ -153,8 +153,13 @@ struct Reassembler {
     out_dir: PathBuf,
     /// 按 (dev_id, segment_seq) 分组，多探针隔离不串段
     segments: HashMap<(u32, u32), SegmentBuf>,
-    /// 去重引用物化缓存：blind_id -> 明文 Chunk 字节
+    /// 去重引用物化缓存：blind_id -> 明文 Chunk 字节（有界，超预算逐出最旧）。
+    /// 被逐出条目使 EXISTS 应答降为 false → 发送端改发数据帧，正确性不受影响。
     blind_cache: HashMap<[u8; 16], Vec<u8>>,
+    /// blind 插入顺序（FIFO 逐出用）
+    blind_order: std::collections::VecDeque<[u8; 16]>,
+    blind_cache_bytes: u64,
+    blind_cache_evicted: u64,
     total_chunks: u64,
     total_refs: u64,
     total_bytes: u64,
@@ -164,6 +169,9 @@ struct Reassembler {
     sealed_segments: u64,
 }
 
+/// 去重引用物化缓存预算（字节）：超出则逐出最旧，保证接收端内存有界。
+const BLIND_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
+
 impl Reassembler {
     fn new(out_dir: PathBuf) -> Self {
         std::fs::create_dir_all(&out_dir).unwrap();
@@ -171,6 +179,9 @@ impl Reassembler {
             out_dir,
             segments: HashMap::new(),
             blind_cache: HashMap::new(),
+            blind_order: std::collections::VecDeque::new(),
+            blind_cache_bytes: 0,
+            blind_cache_evicted: 0,
             total_chunks: 0,
             total_refs: 0,
             total_bytes: 0,
@@ -178,6 +189,28 @@ impl Reassembler {
             cache_miss: 0,
             gaps: 0,
             sealed_segments: 0,
+        }
+    }
+
+    /// 插入缓存并在超预算时逐出最旧（FIFO）。逐出只影响去重命中率，不影响正确性。
+    fn cache_insert(&mut self, blind_id: [u8; 16], bytes: Vec<u8>) {
+        let len = bytes.len() as u64;
+        if let Some(old) = self.blind_cache.insert(blind_id, bytes) {
+            self.blind_cache_bytes -= old.len() as u64;
+        } else {
+            self.blind_order.push_back(blind_id);
+        }
+        self.blind_cache_bytes += len;
+        while self.blind_cache_bytes > BLIND_CACHE_BUDGET {
+            match self.blind_order.pop_front() {
+                Some(oldest) => {
+                    if let Some(v) = self.blind_cache.remove(&oldest) {
+                        self.blind_cache_bytes -= v.len() as u64;
+                        self.blind_cache_evicted += 1;
+                    }
+                }
+                None => break,
+            }
         }
     }
 
@@ -217,7 +250,7 @@ impl Reassembler {
             match decrypt(cipher_key, cipher) {
                 Some(p) => {
                     if let Some(id) = blind_id {
-                        self.blind_cache.insert(id, p.clone());
+                        self.cache_insert(id, p.clone());
                     }
                     p
                 }
@@ -299,7 +332,7 @@ impl Reassembler {
 
     fn stats(&self) -> String {
         format!(
-            "chunks={} refs={} bytes={} unframed={} cache_miss={} gaps={} sealed={} active_segments={}",
+            "chunks={} refs={} bytes={} unframed={} cache_miss={} gaps={} sealed={} active_segments={} cache_bytes={} evicted={}",
             self.total_chunks,
             self.total_refs,
             self.total_bytes,
@@ -307,7 +340,9 @@ impl Reassembler {
             self.cache_miss,
             self.gaps,
             self.sealed_segments,
-            self.segments.len()
+            self.segments.len(),
+            self.blind_cache_bytes,
+            self.blind_cache_evicted,
         )
     }
 
