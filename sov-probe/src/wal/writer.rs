@@ -71,6 +71,11 @@ impl WalWriter {
 
     /// 消费通道中的记录并落盘。
     /// degraded 时丢弃（Drop-Tail），fail-open。
+    ///
+    /// TC-3 实测缺陷修复：原实现 `rx.recv()` 阻塞等待，洪泛结束后通道排空，
+    /// writer 卡在 recv 上不再迭代 → `hot_path_check` 永不再执行 → `degraded`
+    /// 永久锁死 true（降级后永不恢复）。改用 `recv_timeout(200ms)`：空闲时
+    /// 周期唤醒执行水位检查，队列回落到一半以下即自动恢复。
     pub fn run(&mut self, rx: &Receiver<WalRecord>) -> anyhow::Result<()> {
         if self.file.is_none() {
             self.open_segment()?;
@@ -78,10 +83,11 @@ impl WalWriter {
         loop {
             // 热路径水位检查（writer 侧持有 Receiver，可查 len）
             self.breaker.hot_path_check(rx, self.queue_watermark);
-            match rx.recv() {
+            match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(record) => {
                     self.handle_record(record)?;
                 }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                 Err(_) => break, // 所有 sender 关闭
             }
             self.maybe_rotate()?;
