@@ -2,7 +2,7 @@
 name = "e2e-tools"
 version = "0.1.0"
 edition = "2021"
-description = "M7 E2E 双 VM 压测工具：sub_save_test 接收重组落盘"
+description = "E2E test tools for sovProbe: sub_save_test receiver/reassembler, WAL generators"
 
 [[bin]]
 name = "sub_save_test"
@@ -22,7 +22,8 @@ path = "src/bin/zenoh_pub_probe.rs"
 
 [dependencies]
 sov-probe = { path = "../sov-probe" }
-slim-common = { path = "../../slimRAG/slim-common" }
+# 共享 Zenoh 帧契约（开源：github.com/dataxcash/slimRAG workspace member slim-common）
+slim-common = { git = "https://github.com/dataxcash/slimRAG.git", branch = "main" }
 zenoh = "1.9.0"
 chacha20poly1305 = "0.10"
 hmac = "0.12"

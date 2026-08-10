@@ -1,36 +1,37 @@
-# sovProbe — 铁幕·带外零信任主权平台网络探针
+# sovProbe — Out-of-Band Zero-Trust Network Probe
 
-> 纯 Rust/eBPF 单二进制旁路网络探针：零拷贝抓包 → 智能裁切 → 内存 WAL，产出标准 64B 契约日志供 slimSync 无缝消费。
+> Pure-Rust/eBPF single-binary out-of-band packet probe: zero-copy capture → smart slicing → in-memory WAL,
+> producing a standard 64-byte contract log that slimSync consumes seamlessly.
 
-## 设计原则（第一硬红线）
+## Design principles (hard red lines)
 
-1. **探针绝不阻塞生产**：Fail-Open，降级时 Drop-Tail 丢包，不反压内核。
-2. **绝不拖垮宿主**：进程 CPU ≤ 2%、RAM ≤ 64MB（超限熔断）。
-3. **RAMDisk 恒定 ≤ 512MB**：段号单向递增 + Unlink-Oldest（删除最旧段），物理文件恒为 max_segments 个，文件名全局唯一。
+1. **Never block production**: fail-open; degrade by Drop-Tail dropping packets, never back-pressuring the kernel.
+2. **Never drag down the host**: process CPU ≤ 2%, RAM ≤ 64 MB (circuit-breaker enforced).
+3. **RAMDisk bounded ≤ 512 MB**: monotonic segment numbers + Unlink-Oldest (remove oldest), physical files constant at `max_segments`, filenames globally unique.
 
-## 架构
+## Architecture
 
 ```
-[ 内核态 eBPF (tc) ]  Port-Filter 白名单 → RingBuffer
+[ kernel eBPF (tc) ]    Port-Filter whitelist → RingBuffer
         ↓
-[ 用户态 sovprobe ]   etherparse 解析 → Head-Slicer → 熔断
+[ userspace sovprobe ]  etherparse parse → Head-Slicer → circuit breaker
         ↓
-/dev/shm/sov-probe/segment_*.wal   ← 64B Header 契约（标准本地管道）
-        ↓  (fnotify)
-[ slimSync ]  FastCDC 去重 → Zenoh → SovVault
+/dev/shm/sov-probe/segment_*.wal   ← 64 B header contract (standard local pipe)
+        ↓  (inotify/fanotify)
+[ slimSync ]  FastCDC → Zenoh → SovVault
 ```
 
-## 快速开始
+## Quick start
 
-### 构建
+### Build
 
 ```bash
-cargo build --release   # 需要 clang + linux 头文件
+cargo build --release   # requires clang + Linux headers
 ```
 
-产物：`target/release/sovprobe`（静态单二进制，<3MB）。
+Artifact: `target/release/sovprobe` (static single binary, <3 MB).
 
-### 运行（需 root/CAP_NET_ADMIN）
+### Run (requires root / CAP_NET_ADMIN)
 
 ```bash
 sudo ./target/release/sovprobe \
@@ -39,19 +40,19 @@ sudo ./target/release/sovprobe \
   --shm-path /dev/shm/sov-probe
 ```
 
-不带 `--capture-ports` 回退全量抓取。
+Omitting `--capture-ports` falls back to full capture.
 
-### 配置
+### Configuration
 
-支持 TOML（`/etc/sovprobe.toml`），CLI 优先级更高：
+TOML at `/etc/sovprobe.toml` (CLI takes precedence):
 
 ```toml
 interfaces = ["eth0"]
 capture_ports = [80, 443, 8080, 5432]
 slice_bytes = 4096
-segment_size = 67108864          # 64MB
+segment_size = 67108864          # 64 MB
 rotate_interval_secs = 5
-max_segments = 8                 # RAMDisk 上限 512MB
+max_segments = 8                 # RAMDisk cap 512 MB
 queue_capacity = 100000
 queue_high_watermark = 80
 cpu_limit_pct = 2.0
@@ -61,9 +62,9 @@ shm_path = "/dev/shm/sov-probe"
 metrics_addr = "0.0.0.0:9101"
 ```
 
-### 指标
+### Metrics
 
-`curl localhost:9101/metrics`：
+`curl localhost:9101/metrics`:
 
 ```
 sovprobe_captured_total
@@ -73,122 +74,122 @@ sovprobe_degraded_now
 sovprobe_slicer_dropped_total
 ```
 
-## WAL 64B 契约（v0.3）
+## WAL 64-byte contract (v0.3)
 
 ```
 Offset  Size  Field             Type
 0       2     magic             u16 = 0x5350 ("SP")
 2       1     version           u8 = 0x03
 3       1     tcp_flags         u8 (FIN/SYN/RST/PSH/ACK/URG)
-4       4     crc32             u32 (覆盖 header 除 crc32 字段全部 + payload)
-8       8     timestamp_ns      u64 大端
-16      16    src_ip            [u8;16] IPv4 高12B=0 低4B=大端
-32      16    dst_ip            [u8;16] 同上
+4       4     crc32             u32 (covers header minus crc32 field + full payload)
+8       8     timestamp_ns      u64 big-endian
+16      16    src_ip            [u8;16] IPv4: high 12 B = 0, low 4 B = big-endian
+32      16    dst_ip            [u8;16] same
 48      2     src_port          u16
 50      2     dst_port          u16
 52      1     proto             u8 (6=TCP,17=UDP)
 53      3     reserved_pad      [u8;3] bit0=DEGRADED bit1=IS_IPV6
-56      4     payload_len       u32 (incl_len，裁切后)
-60      4     orig_payload_len  u32 (orig_len，线上原始)
+56      4     payload_len       u32 (incl_len, sliced)
+60      4     orig_payload_len  u32 (orig_len, on-wire)
 ───────────────────────────
-64 字节 header + payload 原样
+64-byte header + payload verbatim
 ```
 
-- **三重完整性校验**（Magic → Length → CRC32）：任一失败即丢弃脏尾，杜绝静默吃坏包。
-- **TRUNCATED** 由 `orig_payload_len > payload_len` 推导；sov2pcap 据此映射 `orig_len > incl_len`，Wireshark 精准提示 snaplen truncated。
-- 定长 64B 缓存行对齐；SovVault 端按 `pos += 64 + payload_len` 精确遍历。
-- FastCDC 切块边界不对齐记录边界，**SovVault 必须做流式字节重组**（Stream Reassembly）。
+- **Triple integrity validation** (Magic → Length → CRC32): any failure drops the dirty tail; no silent bad packets.
+- **TRUNCATED** derived from `orig_payload_len > payload_len`; `sov2pcap` maps `orig_len > incl_len`, and Wireshark shows an accurate snaplen-truncated hint.
+- Fixed 64-byte cache-line alignment; SovVault iterates precisely via `pos += 64 + payload_len`.
+- FastCDC chunk boundaries do **not** align to record boundaries — **SovVault must do streaming byte reassembly**.
 
-## 降级与熔断（双层）
+## Degradation & circuit breaker (dual layer)
 
-| 层 | 触发 | 延迟 |
-|----|------|------|
-| 热路径 | crossbeam 队列水位 > 80% | 毫秒级原子置位 |
-| 慢采样 | 进程 RAM > 64MB / 宿主负载 > 85% | 1s procfs 轮询 |
+| Layer | Trigger | Latency |
+|-------|---------|---------|
+| Hot path | crossbeam queue watermark > 80% | millisecond atomic set |
+| Slow path | process RAM > 64 MB / host load > 85% | 1 s procfs poll |
 
-degraded 期间新帧直接丢弃（Drop-Tail），绝不阻塞 ringbuf/内核。
+While degraded, new frames are dropped (Drop-Tail), never blocking the ringbuf/kernel.
 
-## 硬核性能与测试报告（真实 VM 实测，2026-08-10）
+## Hardcore performance & test report (real VM measurements, 2026-08-10)
 
-> 全链路在真实 halo VM（VM-1=sovProbe+slimSync，VM-2=接收+注入，宿主 br0 桥接）上完成，
-> 注入工具用内核 `/proc/net/pktgen`（零依赖，替代 DPDK），断言走 `:9101/metrics` + 落盘 md5 对账。
+> Full chain verified on real halo VMs (VM-1 = sovProbe + slimSync, VM-2 = receiver + generator, bridged).
+> Injection uses in-kernel `/proc/net/pktgen` (zero-dependency, replaces DPDK); assertions via `:9101/metrics` + on-disk md5.
 
-### 极致轻量
-- **源码仅 ~1.7k 行**（纯 Rust 1,535 行 + eBPF C 内核程序），零 C 运行时依赖、零第三方抓包库（`aya` + `etherparse`），**单静态二进制仅 2.1MB**。
-- 常驻内存 **空闲 36MB**（熔断阈值 64MB 的 56%，随时有 28MB 降级缓冲）；空闲 CPU **<0.5%**（5s 实测 0.2%），几乎不产生可感知开销。
+### Extremely lightweight
+- **~1.7k lines of source** (1,535 Rust + eBPF C), zero C-runtime dependencies, zero third-party capture libs (`aya` + `etherparse`), **single static binary 2.1 MB**.
+- Idle **36 MB RAM** (56% of the 64 MB breaker threshold — always 28 MB headroom); idle CPU **<0.5%** (0.2% measured over 5 s).
 
-### 超快单测
-- **核心 WAL Header v0.3 算法 9 项单测全绿，仅 0.03s**：覆盖 Magic→Length→CRC32 **三重防脏数据校验**（任一失败即丢脏尾，杜绝静默吃坏包）、64B 定长缓存行对齐、段号单调递增、Unlink-Oldest 预算、重启续段。
+### Blazing-fast unit tests
+- **9 unit tests, all green in 0.03 s**: WAL v0.3 Magic→Length→CRC32 **triple anti-dirty-data validation**, 64 B cache-line alignment, monotonic segment numbers, Unlink-Oldest budget, restart-resume.
 
-### 真实 VM 级 E2E 压测（数据说话）
-| 场景 | 结果 | 证据 |
-|------|------|------|
-| 11 段受控复验 | **md5 11/11 100% PASS** | 2200 条记录 / 187 chunk，冷启动段状态机不漏段 |
-| 真实流量 1885 req/s | **链路无损追平** | 探针捕获 → WAL → slimSync → 接收端重组 **1.4GB / 57.8 万 chunk**，现存段 **md5 6/6 字节级一致** |
-| TC-3a Port-Filter 放行 | **非目标包 0 捕获** | 12M 个 5001 端口包 @200k pps → `written` 恒定，白名单只收 8080 |
-| TC-3b Drop-Tail 降级 | **354 万帧按语义丢弃** | 12M 个 8080 端口包 @200k pps → 队列瞬超 80% 水位，Fail-Open 绝不阻塞内核 |
-| TC-3b 自动恢复 | **降级后自动自愈** | 负载回落 → degraded 归零、写入恢复增长；RSS 峰值 350MB 经 `malloc_trim` 回落 36MB |
+### Real VM E2E (data-driven)
+| Scenario | Result |
+|----------|--------|
+| 11-segment controlled re-verification | **md5 11/11 100% PASS** (2200 records / 187 chunks, cold-start segment state machine drops nothing) |
+| Real traffic @ 1885 req/s | lossless pipeline: probe capture → WAL → slimSync → **1.4 GB / 578 k chunks** reassembled, **md5 6/6 byte-identical** |
+| TC-3a Port-Filter pass-through | 12 M packets to port 5001 @ 200 k pps → **0 captured** (whitelist only sees 8080) |
+| TC-3b Drop-Tail degradation | 12 M packets to port 8080 @ 200 k pps → **3.54 M dropped** per semantics, fail-open never blocks the kernel |
+| TC-3b auto-recovery | load recedes → degraded clears, writes resume, RSS 350 MB → 36 MB via `malloc_trim` |
 
-### 懂得自愈的双层熔断（TC-3 实测验证）
-- **热路径**：crossbeam 队列水位 > 80% → 毫秒级原子置位 Drop-Tail。
-- **慢采样**：procfs 1s 轮询，进程 RSS > 64MB 或宿主负载 > 85% → 秒级降级。
-- **自动自愈**（TC-3 实测发现"永不恢复"缺陷后修复并复验）：RSS/负载双回落到阈值 ~80% 以下自动解除降级；周期 `malloc_trim(0)` 归还分配器滞留堆，洪泛高水位不再误触发熔断。
-- 熔断期间**只丢新帧、绝不反压内核**——生产挂载零焦虑：降级可观测、恢复可自动、宿主开销可预期。
+### Self-healing dual-layer breaker (verified in TC-3)
+- **Hot path**: queue watermark > 80% → millisecond atomic Drop-Tail.
+- **Slow path**: procfs 1 s poll, process RSS > 64 MB or host load > 85% → second-level degradation.
+- **Auto-recovery** (fixed after TC-3 exposed a never-recovering defect, then re-verified): RSS *and* load both falling below ~80% of their thresholds clears degradation; periodic `malloc_trim(0)` returns allocator-retained heap so RSS reflects real working set, not a flood high-water mark.
+- While degraded, **only new frames are dropped — the kernel is never back-pressured**: observable degradation, automatic recovery, predictable host cost.
 
-## 与 slimSync 集成
+## Integration with slimSync
 
-slimSync 将 `/dev/shm/sov-probe` 作为 watch dir 监听即可（`.wal` 扩展名自动走 FastCDC 字节流轨，零改动）：
+slimSync watches `/dev/shm/sov-probe` as its watch dir (`.wal` extension automatically uses the FastCDC byte-stream track, zero changes):
 
 ```toml
 [watch]
 dirs = ["/dev/shm/sov-probe"]
 ```
 
-**段号单向递增**：segment_0000.wal, segment_0001.wal, ... 永不回写同名文件。超限时 sovProbe 直接 `remove_file` 删除最旧段（Unlink-Oldest），slimSync 比对文件名序号即可感知「旧段已抛弃」；新段是新 inode，触发 `IN_CREATE`，与「追加」语义无歧义。slimSync 崩溃/断网不影响探针采集；网络恢复后从 read_cursor 增量续读。
+**Monotonic segment numbers**: `segment_0000.wal, segment_0001.wal, …` never rewrite the same filename. On overflow sovProbe `remove_file`s the oldest segment (Unlink-Oldest); slimSync detects "old segment discarded" by comparing sequence numbers. New segments are new inodes → trigger `IN_CREATE`, unambiguous vs. append. slimSync crashes / network loss never affect probe capture; on recovery it resumes incrementally from the read cursor.
 
-## WAL → PCAP 离线转码（sov2pcap）
+## WAL → PCAP offline decode (sov2pcap)
 
-出问题时直接转 pcap 扔进 Wireshark：
+Convert to pcap and drop into Wireshark when troubleshooting:
 
 ```bash
-# 单个 WAL
+# Single WAL
 sov2pcap -i /dev/shm/sov-probe/segment_0101.wal -o /tmp/dump.pcap
-# 批量 + 端口过滤
+# Batch + port filter
 sov2pcap -d /dev/shm/sov-probe/ -O /tmp/pcaps/ --filter-port 8080
 ```
 
-从 64B Header 恢复五元组/时间戳，合成 Ethernet + IPv4/IPv6 + TCP/UDP 头输出标准 PCAP。**注意**：TCP seq/ack 为合成占位、协议头校验和置 0（Wireshark 自算），适用于 HTTP/API 请求语义分析；TCP 流重组/重传分析需 Header v0.3（补充 TCP flags/seq）后实现。
+Reconstructs 5-tuple / timestamps from the 64 B header, synthesizes Ethernet + IPv4/IPv6 + TCP/UDP headers, and outputs standard PCAP. **Note**: TCP seq/ack are synthesized placeholders and protocol checksums are zeroed (Wireshark recomputes) — suitable for HTTP/API request-semantics analysis; TCP stream reassembly / retransmission analysis awaits Header v0.3 (TCP flags/seq) support.
 
-## 目录结构
+## Directory layout
 
 ```
 src/
-├── main.rs          CLI + 线程编排
-├── lib.rs           公共库（wal/parse/guard/capture 供工具复用）
-├── config.rs        配置（CLI + TOML）
-├── capture/         eBPF 加载 + Port-Filter + RingBuffer
-├── parse/slicer.rs  零拷贝解析 + 裁切
-├── guard/breaker.rs 双层熔断
-├── wal/             64B header + writer + Unlink-Oldest 轮转
-├── bin/genwal.rs    WAL 生成测试工具
-└── bin/sov2pcap.rs  WAL → PCAP 离线转码
-bpf/capture.bpf.c    内核态端口白名单过滤
+├── main.rs          CLI + thread orchestration
+├── lib.rs           public library (wal/parse/guard/capture reused by tools)
+├── config.rs        config (CLI + TOML)
+├── capture/         eBPF load + Port-Filter + RingBuffer
+├── parse/slicer.rs  zero-copy parse + slicing
+├── guard/breaker.rs dual-layer circuit breaker
+├── wal/             64 B header + writer + Unlink-Oldest rotation
+├── bin/genwal.rs    WAL generation test tool
+└── bin/sov2pcap.rs  WAL → PCAP offline decoder
+bpf/capture.bpf.c    kernel-side port whitelist filter
 ```
 
-## 测试
+## Tests
 
 ```bash
-cargo test            # header 契约、单调递增段号、Unlink-Oldest、残段重组
-cargo run --release --bin genwal /tmp/sov-probe   # 生成测试 WAL
+cargo test            # header contract, monotonic segments, Unlink-Oldest, residual reassembly
+cargo run --release --bin genwal /tmp/sov-probe        # generate test WAL
 cargo run --release --bin sov2pcap -i /tmp/sov-probe/segment_0000.wal -o /tmp/a.pcap
 ```
 
-## 验收目标
+## Acceptance targets
 
-| 指标 | 目标 | 当前 |
-|------|------|------|
-| 二进制体积 | <10MB | **2.1MB** ✅ |
-| 常驻 RAM | <30MB | 空闲 16~36MB（熔断阈值 64MB，留 28MB 降级缓冲）✅ |
-| 进程 CPU | ≤2% | 空闲 0.2%（5s 实测）✅ |
-| RAMDisk | ≤512MB | Unlink-Oldest 保障（8 段 × 64MB = 512MB 恒定）✅ |
-| 吞吐 | ≥200k pps | **200k pps 实测 PASS**（TC-3 内核 pktgen，见上）✅ |
+| Metric | Target | Current |
+|--------|--------|---------|
+| Binary size | <10 MB | **2.1 MB** ✅ |
+| Resident RAM | <30 MB | idle 16–36 MB (breaker threshold 64 MB, 28 MB degradation headroom) ✅ |
+| Process CPU | ≤2% | idle 0.2% (5 s measured) ✅ |
+| RAMDisk | ≤512 MB | Unlink-Oldest enforced (8 × 64 MB = 512 MB constant) ✅ |
+| Throughput | ≥200 k pps | **200 k pps PASS** (TC-3, in-kernel pktgen) ✅ |
