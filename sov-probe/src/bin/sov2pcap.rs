@@ -151,3 +151,109 @@ fn synthesize(rec: &WalRecord) -> Vec<u8> {
     out.extend_from_slice(&rec.payload);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sov_probe::wal::header::{encode_ip, TCP_ACK, TCP_SYN};
+
+    fn record(proto: u16, tcp_flags: u8) -> WalRecord {
+        WalRecord {
+            timestamp_ns: 1_700_000_000_000,
+            flags: 0,
+            tcp_flags,
+            src_ip: encode_ip(Some([192, 168, 1, 10]), None).0,
+            dst_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
+            src_port: 12345,
+            dst_port: 443,
+            proto,
+            orig_payload_len: 5,
+            payload: b"hello".to_vec(),
+        }
+    }
+
+    fn cli(output: Option<&str>, out_dir: Option<&str>) -> Cli {
+        Cli {
+            input: None,
+            dir: None,
+            output: output.map(String::from),
+            out_dir: out_dir.map(String::from),
+            filter_port: None,
+        }
+    }
+
+    #[test]
+    fn synthesize_tcp_ipv4_layout() {
+        let rec = record(6, TCP_SYN | TCP_ACK);
+        let packet = synthesize(&rec);
+        let expect_len = 14 + 20 + (20 + rec.payload.len());
+        assert_eq!(packet.len(), expect_len);
+        // Ethernet II：dst_mac / src_mac / ethertype 0x0800
+        assert_eq!(&packet[0..6], &[0x02, 0, 0, 0, 0, 2]);
+        assert_eq!(&packet[6..12], &[0x02, 0, 0, 0, 0, 1]);
+        assert_eq!(&packet[12..14], &[0x08, 0x00]);
+        // IPv4：IHL/version=0x45，protocol=6，地址正确
+        assert_eq!(packet[14], 0x45);
+        assert_eq!(packet[14 + 9], 6);
+        assert_eq!(&packet[14 + 12..14 + 16], &[192, 168, 1, 10]);
+        assert_eq!(&packet[14 + 16..14 + 20], &[10, 0, 0, 1]);
+        // TCP：src/dst 端口，flags 字节保真（IPv4 头 20B + TCP 头内 offset 13）
+        let tcp = 14 + 20;
+        assert_eq!(&packet[tcp..tcp + 2], &[48, 57]); // 12345 BE
+        assert_eq!(&packet[tcp + 2..tcp + 4], &[1, 187]); // 443 BE
+        assert_eq!(packet[tcp + 13], TCP_SYN | TCP_ACK);
+        // payload 尾部原样
+        assert_eq!(&packet[expect_len - 5..], b"hello");
+    }
+
+    #[test]
+    fn synthesize_udp_ipv4_layout() {
+        let rec = record(17, 0);
+        let packet = synthesize(&rec);
+        let expect_len = 14 + 20 + (8 + rec.payload.len());
+        assert_eq!(packet.len(), expect_len);
+        assert_eq!(packet[14 + 9], 17);
+        // UDP length 字段 = 8 + payload
+        let udp = 14 + 20;
+        let ulen = u16::from_be_bytes([packet[udp + 4], packet[udp + 5]]);
+        assert_eq!(ulen, 8 + rec.payload.len() as u16);
+    }
+
+    #[test]
+    fn synthesize_ipv6_layout() {
+        let mut rec = record(6, TCP_SYN);
+        rec.flags |= FLAG_IS_IPV6;
+        rec.src_ip = encode_ip(None, Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])).0;
+        rec.dst_ip = encode_ip(None, Some([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])).0;
+        let packet = synthesize(&rec);
+        let expect_len = 14 + 40 + (20 + rec.payload.len());
+        assert_eq!(packet.len(), expect_len);
+        assert_eq!(&packet[12..14], &[0x86, 0xDD], "IPv6 ethertype");
+        assert_eq!(packet[14] >> 4, 6, "IP version nibble = 6");
+        assert_eq!(packet[14 + 6], 6, "next header = TCP");
+        assert_eq!(&packet[14 + 8..14 + 24], &rec.src_ip);
+        assert_eq!(&packet[14 + 24..14 + 40], &rec.dst_ip);
+    }
+
+    #[test]
+    fn output_path_single_file() {
+        let c = cli(Some("/tmp/out.pcap"), None);
+        let p = output_path(&c, Path::new("/tmp/a.wal")).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/out.pcap"));
+    }
+
+    #[test]
+    fn output_path_out_dir() {
+        let c = cli(None, Some("/tmp/converted"));
+        let p = output_path(&c, Path::new("/tmp/seg_0005.wal")).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/converted/seg_0005.pcap"));
+        let _ = std::fs::remove_dir_all("/tmp/converted");
+    }
+
+    #[test]
+    fn output_path_default() {
+        let c = cli(None, None);
+        let p = output_path(&c, Path::new("/tmp/seg_0000.wal")).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/seg_0000.wal.pcap"));
+    }
+}

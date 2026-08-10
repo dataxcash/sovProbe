@@ -77,3 +77,69 @@ impl Metrics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    fn parse_metric(body: &str, name: &str) -> Option<u64> {
+        body.lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.trim().parse().ok())
+    }
+
+    #[test]
+    fn fresh_render_is_zero() {
+        let m = Metrics::default();
+        let body = m.render(false);
+        // 全部 counter 为 0，degraded_now gauge 为 0
+        assert_eq!(parse_metric(&body, "sovprobe_captured_total"), Some(0));
+        assert_eq!(parse_metric(&body, "sovprobe_written_total"), Some(0));
+        assert_eq!(parse_metric(&body, "sovprobe_dropped_total"), Some(0));
+        assert_eq!(parse_metric(&body, "sovprobe_degraded_total"), Some(0));
+        assert_eq!(parse_metric(&body, "sovprobe_slicer_dropped_total"), Some(0));
+        assert_eq!(parse_metric(&body, "sovprobe_degraded_now"), Some(0));
+    }
+
+    #[test]
+    fn render_reflects_counter_values() {
+        let m = Metrics::default();
+        m.captured.fetch_add(10, Ordering::Relaxed);
+        m.written.fetch_add(7, Ordering::Relaxed);
+        m.dropped.fetch_add(3, Ordering::Relaxed);
+        m.degraded.fetch_add(2, Ordering::Relaxed);
+        m.slicer_dropped.fetch_add(1, Ordering::Relaxed);
+        let body = m.render(true);
+        assert_eq!(parse_metric(&body, "sovprobe_captured_total"), Some(10));
+        assert_eq!(parse_metric(&body, "sovprobe_written_total"), Some(7));
+        assert_eq!(parse_metric(&body, "sovprobe_dropped_total"), Some(3));
+        assert_eq!(parse_metric(&body, "sovprobe_degraded_total"), Some(2));
+        assert_eq!(parse_metric(&body, "sovprobe_slicer_dropped_total"), Some(1));
+        assert_eq!(parse_metric(&body, "sovprobe_degraded_now"), Some(1), "降级中 gauge=1");
+    }
+
+    #[test]
+    fn render_is_prometheus_wellformed() {
+        let m = Metrics::default();
+        let body = m.render(false);
+        // 每行 metric 都有 TYPE/HELP 声明，且无缺失换行
+        assert!(body.contains("# HELP sovprobe_captured_total"));
+        assert!(body.contains("# TYPE sovprobe_captured_total counter"));
+        assert!(body.contains("# TYPE sovprobe_degraded_now gauge"));
+        assert!(body.ends_with('\n'));
+        assert!(body.lines().count() >= 12);
+    }
+
+    #[test]
+    fn degraded_gauge_tracks_atomic_bool() {
+        let m = Metrics::default();
+        let degraded = Arc::new(AtomicBool::new(true));
+        let body = m.render(degraded.load(Ordering::Relaxed));
+        assert_eq!(parse_metric(&body, "sovprobe_degraded_now"), Some(1));
+        degraded.store(false, Ordering::Relaxed);
+        let body2 = m.render(degraded.load(Ordering::Relaxed));
+        assert_eq!(parse_metric(&body2, "sovprobe_degraded_now"), Some(0));
+    }
+}

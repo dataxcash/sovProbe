@@ -104,16 +104,16 @@ fn main() -> anyhow::Result<()> {
     let dropped_counter = metrics.dropped.clone();
 
     // WAL 写入线程
-    let mut writer = wal::writer::WalWriter::new(
-        &cfg.shm_path,
-        cfg.max_segments,
-        cfg.segment_size,
-        Duration::from_secs(cfg.rotate_interval_secs),
-        breaker.clone(),
-        cfg.queue_high_watermark,
-        written_counter,
-        dropped_counter,
-    )?;
+    let mut writer = wal::writer::WalWriter::new(wal::writer::WriterParams {
+        shm_path: cfg.shm_path.clone(),
+        max_segments: cfg.max_segments,
+        segment_size: cfg.segment_size,
+        rotate_interval: Duration::from_secs(cfg.rotate_interval_secs),
+        breaker: breaker.clone(),
+        queue_watermark: cfg.queue_high_watermark,
+        written_records: written_counter,
+        dropped_records: dropped_counter,
+    })?;
     let writer_rx = rx.clone();
     std::thread::spawn(move || {
         if let Err(e) = writer.run(&writer_rx) {

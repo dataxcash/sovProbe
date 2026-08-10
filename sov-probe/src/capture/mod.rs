@@ -33,7 +33,7 @@ impl Capture {
             .ok_or_else(|| anyhow::anyhow!("port_filter_map 不存在"))?
             .try_into()?;
         for port in &cfg.capture_ports {
-            port_filter.insert(port, &1u8, 0)?;
+            port_filter.insert(port, 1u8, 0)?;
         }
         info!(
             "port_filter_map 已加载 {} 个端口",

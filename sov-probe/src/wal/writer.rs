@@ -10,6 +10,19 @@ use super::header::WalRecord;
 use super::rotate::Rotator;
 use crate::guard::breaker::Breaker;
 
+/// WalWriter 构造参数聚合（避免 8 参数过长的 `new`）。
+#[derive(Clone)]
+pub struct WriterParams {
+    pub shm_path: String,
+    pub max_segments: usize,
+    pub segment_size: u64,
+    pub rotate_interval: Duration,
+    pub breaker: Breaker,
+    pub queue_watermark: u8,
+    pub written_records: Arc<AtomicU64>,
+    pub dropped_records: Arc<AtomicU64>,
+}
+
 /// SHM Ring-WAL Writer：追加写 64B header + payload，定长/定时双轮转，
 /// Ring-Overwrite 强制覆盖，写满 drop-tail（绝不阻塞）。
 pub struct WalWriter {
@@ -28,30 +41,21 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    pub fn new(
-        shm_path: &str,
-        max_segments: usize,
-        segment_size: u64,
-        rotate_interval: Duration,
-        breaker: Breaker,
-        queue_watermark: u8,
-        written_records: Arc<AtomicU64>,
-        dropped_records: Arc<AtomicU64>,
-    ) -> anyhow::Result<Self> {
-        fs::create_dir_all(shm_path)?;
-        let rotator = Rotator::new(shm_path, max_segments)?;
+    pub fn new(params: WriterParams) -> anyhow::Result<Self> {
+        fs::create_dir_all(&params.shm_path)?;
+        let rotator = Rotator::new(&params.shm_path, params.max_segments)?;
         Ok(Self {
             rotator,
-            segment_size,
-            rotate_interval,
+            segment_size: params.segment_size,
+            rotate_interval: params.rotate_interval,
             file: None,
             current_path: std::path::PathBuf::new(),
             written: 0,
-            next_rotate: Instant::now() + rotate_interval,
-            breaker,
-            queue_watermark,
-            written_records,
-            dropped_records,
+            next_rotate: Instant::now() + params.rotate_interval,
+            breaker: params.breaker,
+            queue_watermark: params.queue_watermark,
+            written_records: params.written_records,
+            dropped_records: params.dropped_records,
         })
     }
 
@@ -59,7 +63,6 @@ impl WalWriter {
         let path = self.rotator.next_segment()?;
         let f = fs::OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&path)?;
         self.file = Some(BufWriter::new(f));
