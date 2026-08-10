@@ -53,19 +53,43 @@ impl Default for Breaker {
 }
 
 /// 第二层：后台 procfs 慢采样线程。
+///
+/// TC-3 实测缺陷修复：原实现只置 degraded 永不恢复（注释称"由热路径水位决定恢复"，
+/// 但 RSS/负载触发的降级热路径无法感知）。洪泛期分配器高水位滞留使 RSS 长期超限 →
+/// 探针永久降级（written 冻结、不随负载回落恢复）。
+/// 方案：
+/// - 触发：RSS 超限 或 负载超限 → degraded=true；
+/// - 恢复：RSS 与负载**双双**回落到触发阈值 ~80%（滞回带）以下 → degraded=false，
+///   避免临界抖动；
+/// - 每周期 `malloc_trim(0)` 归还分配器滞留堆，使 RSS 反映真实工作集而非高水位。
 pub fn run_background_sampler(
     cfg: Config,
     degraded: Arc<AtomicBool>,
     loop_interval: Duration,
 ) {
     std::thread::spawn(move || loop {
-        // 进程自身 RSS 超限
+        // 归还分配器滞留堆：洪泛期大量 4KB 级 Vec 分配后，arena 高水位滞留会让
+        // RSS 长期虚高 → ram_limit 误触发且无法恢复
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+
+        let mut should_recover = true;
+
+        // 进程自身 RSS
         if let Ok(mem) = procfs::process::Process::myself().and_then(|p| p.statm()) {
             let rss_bytes = mem.resident as u64 * 4096;
-            if rss_bytes > cfg.ram_limit_mb * 1024 * 1024 {
+            let limit = cfg.ram_limit_mb as u64 * 1024 * 1024;
+            if rss_bytes > limit {
                 degraded.store(true, Ordering::Release);
+                should_recover = false;
+            } else if rss_bytes > limit * 8 / 10 {
+                // 滞回带内：保持现状，避免临界抖动
+                should_recover = false;
             }
         }
+
         // 宿主整体负载
         if let Ok(load) = procfs::LoadAverage::current() {
             let one_min = load.one;
@@ -75,9 +99,17 @@ pub fn run_background_sampler(
             let pct = (one_min / cores * 100.0) as u8;
             if pct > cfg.host_cpu_limit_pct {
                 degraded.store(true, Ordering::Release);
+                should_recover = false;
+            } else if pct > cfg.host_cpu_limit_pct * 8 / 10 {
+                should_recover = false;
             }
         }
-        // 未触发 → 由热路径水位决定恢复，慢采样不做恢复（避免抖动）
+
+        // RSS 与负载双双回落到阈值以下 → 自动恢复（滞回防抖）
+        if should_recover {
+            degraded.store(false, Ordering::Release);
+        }
+
         std::thread::sleep(loop_interval);
     });
 }

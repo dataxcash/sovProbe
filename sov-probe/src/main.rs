@@ -97,6 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     // 通道
     let (tx, rx) = bounded::<wal::header::WalRecord>(cfg.queue_capacity);
+    let rx = std::sync::Arc::new(rx);
 
     // 共享计数
     let written_counter = metrics.written.clone();
@@ -113,8 +114,9 @@ fn main() -> anyhow::Result<()> {
         written_counter,
         dropped_counter,
     )?;
+    let writer_rx = rx.clone();
     std::thread::spawn(move || {
-        if let Err(e) = writer.run(&rx) {
+        if let Err(e) = writer.run(&writer_rx) {
             error!("WAL writer 退出异常: {e}");
         }
     });
@@ -134,15 +136,19 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_secs(10));
         if breaker.degraded.load(Ordering::Acquire) {
             warn!(
-                "当前处于降级模式（Drop-Tail 中），已丢弃 {} 条",
-                metrics.dropped.load(Ordering::Relaxed)
+                "当前处于降级模式（Drop-Tail 中），已丢弃 {} 条, queue_fill={}/{}",
+                metrics.dropped.load(Ordering::Relaxed),
+                rx.len(),
+                cfg.queue_capacity
             );
         } else {
             info!(
-                "心跳: written={}, dropped={}, degraded_ev={}",
+                "心跳: written={}, dropped={}, degraded_ev={}, queue_fill={}/{}",
                 metrics.written.load(Ordering::Relaxed),
                 metrics.dropped.load(Ordering::Relaxed),
                 metrics.degraded.load(Ordering::Relaxed),
+                rx.len(),
+                cfg.queue_capacity
             );
         }
     }
