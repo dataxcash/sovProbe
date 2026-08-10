@@ -1,6 +1,6 @@
-use sov_probe::wal::header::{encode_ip, WalRecord};
+use sov_probe::wal::header::WalRecord;
 
-/// 集成测试工具：生成一条标准 WAL（64B header 契约）供 slimSync 消费验证。
+/// 集成测试工具：生成一条标准 WAL（64B header v0.4 契约）供 slimSync 消费验证。
 /// usage: genwal <dir>
 fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).ok_or_else(|| anyhow::anyhow!("usage: genwal <dir>"))?;
@@ -17,8 +17,11 @@ fn main() -> anyhow::Result<()> {
             timestamp_ns: 1_700_000_000_000 + i as u64,
             flags: 0,
             tcp_flags: 0x02, // SYN
-            src_ip: encode_ip(Some([192, 168, 1, 10]), None).0,
-            dst_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
+            tcp_seq: 1000 + i,
+            tcp_ack: 0,
+            window_size: 65535,
+            src_ip: [192, 168, 1, 10],
+            dst_ip: [10, 0, 0, 1],
             src_port: 12345,
             dst_port: 443,
             proto: 6,

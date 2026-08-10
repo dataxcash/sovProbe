@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use clap::Parser;
 use pcap_file::pcap::{PcapPacket, PcapWriter};
-use sov_probe::wal::header::{WalRecord, FLAG_IS_IPV6};
+use sov_probe::wal::header::WalRecord;
 
 /// sov2pcap — 离线 WAL → 标准 PCAP 转码工具。
 ///
-/// 从 64B Header 恢复五元组与时间戳，合成 Ethernet + IP + TCP/UDP 头，
-/// 输出标准 .pcap（DataLink=ETHERNET），供 Wireshark / TShark / Suricata 分析。
+/// 从 64B Header 恢复五元组、时间戳与**真实 TCP seq/ack/window**，合成
+/// Ethernet + IPv4 + TCP/UDP 头，输出标准 .pcap（DataLink=ETHERNET），
+/// 供 Wireshark / TShark / Suricata 做会话还原、REQ/RESP 匹配、丢包/乱序/RTT 分析。
 #[derive(Parser, Debug)]
 #[command(name = "sov2pcap", version, about)]
 struct Cli {
@@ -71,10 +72,9 @@ fn main() -> anyhow::Result<()> {
             let packet = synthesize(rec);
             let ts = Duration::from_nanos(rec.timestamp_ns);
             // incl_len = 实际落盘字节（packet.len()）
-            // orig_len = orig_payload_len + L2(14) + L3(20/40) + L4(20/8)
-            let l3_len = if rec.flags & FLAG_IS_IPV6 != 0 { 40 } else { 20 };
+            // orig_len = orig_payload_len + L2(14) + L3(20) + L4(20/8)
             let l4_len = if rec.proto == 6 { 20 } else { 8 };
-            let orig_len = 14 + l3_len + l4_len + rec.orig_payload_len as usize;
+            let orig_len = 14 + 20 + l4_len + rec.orig_payload_len as usize;
             writer.write_packet(&PcapPacket::new(ts, orig_len as u32, &packet))?;
             n += 1;
         }
@@ -97,41 +97,26 @@ fn output_path(cli: &Cli, f: &Path) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(format!("{}.pcap", f.display())))
 }
 
-/// 合成一条完整帧：Ethernet + IPv4/IPv6 + TCP/UDP + payload。
-/// 校验和置 0（Wireshark 自行计算）；TCP seq/ack 为合成占位。
+/// 合成一条完整帧：Ethernet + IPv4 + TCP/UDP + payload（v0.4 起仅 IPv4）。
+/// 校验和置 0（Wireshark 自行计算）；seq/ack/window 填**真实线上值**。
 fn synthesize(rec: &WalRecord) -> Vec<u8> {
     let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
     let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
-    let is_v6 = rec.flags & FLAG_IS_IPV6 != 0;
     let l4_len = (if rec.proto == 6 { 20 } else { 8 }) + rec.payload.len();
 
-    let mut out = Vec::with_capacity(14 + if is_v6 { 40 } else { 20 } + l4_len);
+    let mut out = Vec::with_capacity(14 + 20 + l4_len);
     // Ethernet II
     out.extend_from_slice(&dst_mac);
     out.extend_from_slice(&src_mac);
-    out.extend_from_slice(if is_v6 { &[0x86, 0xDD] } else { &[0x08, 0x00] });
+    out.extend_from_slice(&[0x08, 0x00]);
 
-    if is_v6 {
-        // IPv6 头（40B）
-        let plen = (l4_len as u16).to_be_bytes();
-        out.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, plen[0], plen[1]]);
-        out.push(rec.proto as u8); // next header
-        out.push(0x40); // hop limit 64
-        out.extend_from_slice(&rec.src_ip);
-        out.extend_from_slice(&rec.dst_ip);
-    } else {
-        // IPv4 头（20B）
-        let mut v4_src = [0u8; 4];
-        let mut v4_dst = [0u8; 4];
-        v4_src.copy_from_slice(&rec.src_ip[12..16]);
-        v4_dst.copy_from_slice(&rec.dst_ip[12..16]);
-        let total = 20 + l4_len;
-        let (t_hi, t_lo) = (((total >> 8) & 0xFF) as u8, (total & 0xFF) as u8);
-        out.extend_from_slice(&[0x45, 0x00, t_hi, t_lo]);
-        out.extend_from_slice(&[0x00, 0x01, 0x40, 0x00, 0x40, rec.proto as u8, 0x00, 0x00]);
-        out.extend_from_slice(&v4_src);
-        out.extend_from_slice(&v4_dst);
-    }
+    // IPv4 头（20B）
+    let total = 20 + l4_len;
+    let (t_hi, t_lo) = (((total >> 8) & 0xFF) as u8, (total & 0xFF) as u8);
+    out.extend_from_slice(&[0x45, 0x00, t_hi, t_lo]);
+    out.extend_from_slice(&[0x00, 0x01, 0x40, 0x00, 0x40, rec.proto as u8, 0x00, 0x00]);
+    out.extend_from_slice(&rec.src_ip);
+    out.extend_from_slice(&rec.dst_ip);
 
     // TCP/UDP 传输层
     let (sp_hi, sp_lo) = ((rec.src_port >> 8) as u8, (rec.src_port & 0xFF) as u8);
@@ -139,10 +124,13 @@ fn synthesize(rec: &WalRecord) -> Vec<u8> {
     if rec.proto == 6 {
         // flags 字节 = 保留位(0) + 8 位 flags。我们的 u8 掩码即 TCP 头 byte13 的 flags 域。
         let flags = rec.tcp_flags;
+        let (seq_b, ack_b) = (rec.tcp_seq.to_be_bytes(), rec.tcp_ack.to_be_bytes());
+        let (win_hi, win_lo) = ((rec.window_size >> 8) as u8, (rec.window_size & 0xFF) as u8);
         out.extend_from_slice(&[
-            sp_hi, sp_lo, dp_hi, dp_lo, 0, 0, 0, 0, // seq(合成)
-            0, 0, 0, 0, // ack(合成)
-            0x50, flags, 0xFF, 0xFF, 0, 0, 0, 0, // hlen/dataoffset + flags/window/checksum/urg
+            sp_hi, sp_lo, dp_hi, dp_lo, // ports
+            seq_b[0], seq_b[1], seq_b[2], seq_b[3], // seq（真实）
+            ack_b[0], ack_b[1], ack_b[2], ack_b[3], // ack（真实）
+            0x50, flags, win_hi, win_lo, 0, 0, 0, 0, // hlen + flags + window + checksum/urg
         ]);
     } else {
         let ulen = ((8 + rec.payload.len()) as u16).to_be_bytes();
@@ -155,15 +143,19 @@ fn synthesize(rec: &WalRecord) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sov_probe::wal::header::{encode_ip, TCP_ACK, TCP_SYN};
+    use sov_probe::wal::header::TCP_ACK;
+    use sov_probe::wal::header::TCP_SYN;
 
     fn record(proto: u16, tcp_flags: u8) -> WalRecord {
         WalRecord {
             timestamp_ns: 1_700_000_000_000,
             flags: 0,
             tcp_flags,
-            src_ip: encode_ip(Some([192, 168, 1, 10]), None).0,
-            dst_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
+            tcp_seq: 0x1122_3344,
+            tcp_ack: 0x5566_7788,
+            window_size: 8192,
+            src_ip: [192, 168, 1, 10],
+            dst_ip: [10, 0, 0, 1],
             src_port: 12345,
             dst_port: 443,
             proto,
@@ -206,6 +198,28 @@ mod tests {
         assert_eq!(&packet[expect_len - 5..], b"hello");
     }
 
+    /// v0.4 核心：真实 seq/ack/window 必须落入 TCP 头（REQ/RESP 匹配 + RTT）。
+    #[test]
+    fn synthesize_tcp_preserves_seq_ack_window() {
+        let rec = record(6, TCP_SYN | TCP_ACK);
+        let packet = synthesize(&rec);
+        let tcp = 14 + 20;
+        // seq 字段 @tcp+4..+8，ack 字段 @tcp+8..+12
+        assert_eq!(
+            u32::from_be_bytes([packet[tcp + 4], packet[tcp + 5], packet[tcp + 6], packet[tcp + 7]]),
+            rec.tcp_seq
+        );
+        assert_eq!(
+            u32::from_be_bytes([packet[tcp + 8], packet[tcp + 9], packet[tcp + 10], packet[tcp + 11]]),
+            rec.tcp_ack
+        );
+        // window 字段 @tcp+14..+16
+        assert_eq!(
+            u16::from_be_bytes([packet[tcp + 14], packet[tcp + 15]]),
+            rec.window_size
+        );
+    }
+
     #[test]
     fn synthesize_udp_ipv4_layout() {
         let rec = record(17, 0);
@@ -217,22 +231,6 @@ mod tests {
         let udp = 14 + 20;
         let ulen = u16::from_be_bytes([packet[udp + 4], packet[udp + 5]]);
         assert_eq!(ulen, 8 + rec.payload.len() as u16);
-    }
-
-    #[test]
-    fn synthesize_ipv6_layout() {
-        let mut rec = record(6, TCP_SYN);
-        rec.flags |= FLAG_IS_IPV6;
-        rec.src_ip = encode_ip(None, Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])).0;
-        rec.dst_ip = encode_ip(None, Some([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])).0;
-        let packet = synthesize(&rec);
-        let expect_len = 14 + 40 + (20 + rec.payload.len());
-        assert_eq!(packet.len(), expect_len);
-        assert_eq!(&packet[12..14], &[0x86, 0xDD], "IPv6 ethertype");
-        assert_eq!(packet[14] >> 4, 6, "IP version nibble = 6");
-        assert_eq!(packet[14 + 6], 6, "next header = TCP");
-        assert_eq!(&packet[14 + 8..14 + 24], &rec.src_ip);
-        assert_eq!(&packet[14 + 24..14 + 40], &rec.dst_ip);
     }
 
     #[test]

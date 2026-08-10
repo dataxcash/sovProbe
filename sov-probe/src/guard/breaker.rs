@@ -117,7 +117,7 @@ pub fn run_background_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::header::{encode_ip, WalRecord};
+    use crate::wal::header::WalRecord;
     use crossbeam_channel::{bounded, unbounded};
 
     fn sample_record() -> WalRecord {
@@ -125,8 +125,11 @@ mod tests {
             timestamp_ns: 1,
             flags: 0,
             tcp_flags: 0x02,
-            src_ip: encode_ip(Some([192, 168, 1, 10]), None).0,
-            dst_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
+            tcp_seq: 0,
+            tcp_ack: 0,
+            window_size: 0,
+            src_ip: [192, 168, 1, 10],
+            dst_ip: [10, 0, 0, 1],
             src_port: 12345,
             dst_port: 443,
             proto: 6,

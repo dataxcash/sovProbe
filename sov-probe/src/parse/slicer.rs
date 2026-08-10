@@ -1,12 +1,13 @@
 use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
 
 use crate::wal::header::{
-    encode_ip, WalRecord, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TCP_URG,
+    WalRecord, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TCP_URG,
 };
 
 /// Payload Head-Slicer：零拷贝定位 L4 层，裁切应用层前 N 字节。
 /// 保留 HTTP Header / JSON 根节点（够 AST/Schema 逆向），剔除大 Body。
-/// v0.3：提取 TCP flags + orig_payload_len（原始线上长度）。
+/// v0.4：提取真实 TCP seq/ack/window（REQ/RESP 匹配、丢包/乱序/RTT 分析）。
+/// 仅捕获 IPv4（v0.4 契约砍原生 IPv6）。
 pub struct Slicer {
     /// 应用层裁切长度
     pub max_payload: usize,
@@ -18,38 +19,23 @@ impl Slicer {
     }
 
     /// 将原始帧（含 Ethernet header）解析并裁切为一条 WAL 记录。
-    /// 非 IP / 非 TCP/UDP / 截断 → None（不计入日志）。
+    /// 非 IPv4 / 非 TCP/UDP / 截断 → None（不计入日志）。
     pub fn process(&self, frame: &[u8], ts_ns: u64, degraded: bool) -> Option<WalRecord> {
         let packet = SlicedPacket::from_ethernet(frame).ok()?;
 
-        // IP 层：取 v4/v6 地址与协议
-        let (src_v4, src_v6, dst_v4, dst_v6, is_v6, proto, transport) = match packet.ip {
+        // IP 层：仅 IPv4（v0.4 起 IPv6 帧不记录）
+        let (src_ip, dst_ip, proto) = match &packet.ip {
             Some(InternetSlice::Ipv4(hdr, _)) => {
                 let src = hdr.source_addr().octets();
                 let dst = hdr.destination_addr().octets();
-                (Some(src), None, Some(dst), None, false, hdr.protocol(), packet.transport)
-            }
-            Some(InternetSlice::Ipv6(hdr, _)) => {
-                let src = hdr.source_addr().octets();
-                let dst = hdr.destination_addr().octets();
-                (None, Some(src), None, Some(dst), true, hdr.next_header(), packet.transport)
+                (src, dst, hdr.protocol())
             }
             _ => return None,
         };
 
         // 传输层：TCP/UDP 才记录
-        let (src_port, dst_port, tcp_flags, app) = match transport {
-            Some(TransportSlice::Tcp(tcp)) => (
-                tcp.source_port(),
-                tcp.destination_port(),
-                extract_tcp_flags(tcp),
-                packet.payload,
-            ),
-            Some(TransportSlice::Udp(udp)) => {
-                (udp.source_port(), udp.destination_port(), 0, packet.payload)
-            }
-            _ => return None,
-        };
+        let (src_port, dst_port, tcp_flags, tcp_seq, tcp_ack, window_size, app) =
+            transport_header(&packet)?;
 
         let orig_payload_len = app.len() as u32;
         let truncated = app.len() > self.max_payload;
@@ -59,9 +45,6 @@ impl Slicer {
             app.to_vec()
         };
 
-        let (src_enc, _) = encode_ip(src_v4, src_v6);
-        let (dst_enc, _) = encode_ip(dst_v4, dst_v6);
-
         let mut flags = 0u64;
         if degraded {
             flags |= crate::wal::header::FLAG_DEGRADED;
@@ -69,22 +52,45 @@ impl Slicer {
         if truncated {
             flags |= crate::wal::header::FLAG_TRUNCATED;
         }
-        if is_v6 {
-            flags |= crate::wal::header::FLAG_IS_IPV6;
-        }
 
         Some(WalRecord {
             timestamp_ns: ts_ns,
             flags,
             tcp_flags,
-            src_ip: src_enc,
-            dst_ip: dst_enc,
+            tcp_seq,
+            tcp_ack,
+            window_size,
+            src_ip,
+            dst_ip,
             src_port,
             dst_port,
             proto: proto.into(),
             orig_payload_len,
             payload: sliced,
         })
+    }
+}
+
+/// 传输层提取结果：端口对、TCP flags、真实 seq/ack/window、应用层 payload。
+/// UDP 无 seq/ack/window → 全 0。
+type TransportMeta<'a> = (u16, u16, u8, u32, u32, u16, &'a [u8]);
+
+/// 传输层头提取：返回 (src_port, dst_port, flags, seq, ack, window, app_payload)。
+fn transport_header<'a>(packet: &'a SlicedPacket<'a>) -> Option<TransportMeta<'a>> {
+    match &packet.transport {
+        Some(TransportSlice::Tcp(tcp)) => Some((
+            tcp.source_port(),
+            tcp.destination_port(),
+            extract_tcp_flags(tcp.clone()),
+            tcp.sequence_number(),
+            tcp.acknowledgment_number(),
+            tcp.window_size(),
+            packet.payload,
+        )),
+        Some(TransportSlice::Udp(udp)) => {
+            Some((udp.source_port(), udp.destination_port(), 0, 0, 0, 0, packet.payload))
+        }
+        _ => None,
     }
 }
 
@@ -115,15 +121,13 @@ fn extract_tcp_flags(tcp: etherparse::TcpHeaderSlice) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::header::{FLAG_DEGRADED, FLAG_IS_IPV6, FLAG_TRUNCATED};
+    use crate::wal::header::{FLAG_DEGRADED, FLAG_TRUNCATED};
     use etherparse::PacketBuilder;
 
     const SRC_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
     const DST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
-    const SRC_V6: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]; // 2001:db8::1
-    const DST_V6: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]; // fe80::1
 
-    /// TCP over IPv4，SYN+ACK，payload 原样。
+    /// TCP over IPv4，SYN+ACK，seq=100 ack=50 window=65535，payload 原样。
     fn tcp_v4_frame(payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         PacketBuilder::ethernet2(SRC_MAC, DST_MAC)
@@ -142,17 +146,6 @@ mod tests {
         PacketBuilder::ethernet2(SRC_MAC, DST_MAC)
             .ipv4([192, 168, 1, 10], [10, 0, 0, 1], 64)
             .udp(12345, 53)
-            .write(&mut buf, payload)
-            .unwrap();
-        buf
-    }
-
-    /// TCP over IPv6。
-    fn tcp_v6_frame(payload: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        PacketBuilder::ethernet2(SRC_MAC, DST_MAC)
-            .ipv6(SRC_V6, DST_V6, 64)
-            .tcp(80, 443, 100, 65535)
             .write(&mut buf, payload)
             .unwrap();
         buf
@@ -184,31 +177,48 @@ mod tests {
         assert_eq!(rec.dst_port, 443);
         assert_eq!(rec.tcp_flags & TCP_SYN, TCP_SYN);
         assert_eq!(rec.tcp_flags & TCP_ACK, TCP_ACK);
-        assert_eq!(rec.src_ip[12..16], [192, 168, 1, 10]);
-        assert_eq!(rec.dst_ip[12..16], [10, 0, 0, 1]);
-        assert_eq!(rec.src_ip[..12], [0u8; 12], "IPv4 高 12B 置 0");
-        assert_eq!(rec.flags & FLAG_IS_IPV6, 0);
+        assert_eq!(rec.src_ip, [192, 168, 1, 10], "v0.4 起 IPv4 原生 4B");
+        assert_eq!(rec.dst_ip, [10, 0, 0, 1]);
         assert_eq!(rec.timestamp_ns, 999);
     }
 
+    /// v0.4 核心：真实 TCP seq/ack/window 必须保真（REQ/RESP 匹配 + RTT）。
     #[test]
-    fn udp_v4_has_no_tcp_flags() {
-        let rec = Slicer::new(4096).process(&udp_v4_frame(b"query"), 5, false).unwrap();
-        assert_eq!(rec.proto, 17);
-        assert_eq!(rec.tcp_flags, 0, "UDP 无 TCP flags");
-        assert_eq!(rec.dst_port, 53);
+    fn tcp_v4_preserves_seq_ack_window() {
+        let rec = Slicer::new(4096)
+            .process(&tcp_v4_frame(b"GET /api HTTP/1.1"), 1, false)
+            .unwrap();
+        assert_eq!(rec.tcp_seq, 100);
+        assert_eq!(rec.tcp_ack, 50);
+        assert_eq!(rec.window_size, 65535);
     }
 
     #[test]
-    fn ipv6_tcp_sets_v6_flag_and_full_addr() {
-        let rec = Slicer::new(4096)
-            .process(&tcp_v6_frame(b"v6"), 7, false)
+    fn udp_v4_zeroed_tcp_fields() {
+        let rec = Slicer::new(4096).process(&udp_v4_frame(b"query"), 5, false).unwrap();
+        assert_eq!(rec.proto, 17);
+        assert_eq!(rec.tcp_flags, 0, "UDP 无 TCP flags");
+        assert_eq!(rec.tcp_seq, 0);
+        assert_eq!(rec.tcp_ack, 0);
+        assert_eq!(rec.window_size, 0);
+        assert_eq!(rec.dst_port, 53);
+    }
+
+    /// v0.4 契约：IPv6 帧不记录（返回 None）。
+    #[test]
+    fn ipv6_frame_rejected_in_v04() {
+        let src: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut frame = Vec::new();
+        PacketBuilder::ethernet2(SRC_MAC, DST_MAC)
+            .ipv6(src, dst, 64)
+            .tcp(80, 443, 1, 65535)
+            .write(&mut frame, b"v6")
             .unwrap();
-        assert_ne!(rec.flags & FLAG_IS_IPV6, 0);
-        assert_eq!(rec.src_ip, SRC_V6, "IPv6 16B 全量保留");
-        assert_eq!(rec.dst_ip, DST_V6);
-        assert_eq!(rec.src_port, 80);
-        assert_eq!(rec.dst_port, 443);
+        assert!(
+            Slicer::new(4096).process(&frame, 7, false).is_none(),
+            "v0.4 仅 IPv4，IPv6 帧应丢弃"
+        );
     }
 
     #[test]

@@ -74,28 +74,33 @@ sovprobe_degraded_now
 sovprobe_slicer_dropped_total
 ```
 
-## WAL 64-byte contract (v0.3)
+## WAL 64-byte contract (v0.4)
 
 ```
 Offset  Size  Field             Type
 0       2     magic             u16 = 0x5350 ("SP")
-2       1     version           u8 = 0x03
+2       1     version           u8 = 0x04
 3       1     tcp_flags         u8 (FIN/SYN/RST/PSH/ACK/URG)
 4       4     crc32             u32 (covers header minus crc32 field + full payload)
 8       8     timestamp_ns      u64 big-endian
-16      16    src_ip            [u8;16] IPv4: high 12 B = 0, low 4 B = big-endian
-32      16    dst_ip            [u8;16] same
-48      2     src_port          u16
-50      2     dst_port          u16
-52      1     proto             u8 (6=TCP,17=UDP)
-53      3     reserved_pad      [u8;3] bit0=DEGRADED bit1=IS_IPV6
+16      4     src_ip            [u8;4] IPv4 big-endian (v0.4: IPv4 only)
+20      4     dst_ip            [u8;4] IPv4 big-endian
+24      2     src_port          u16
+26      2     dst_port          u16
+28      1     proto             u8 (6=TCP,17=UDP)
+29      4     tcp_seq           u32 real TCP sequence number
+33      4     tcp_ack           u32 real TCP acknowledgment number
+37      2     window_size       u16 real TCP window
+39      1     flags             u8 bit0=DEGRADED, bits1-7 reserved (0)
+40      16    reserved_pad      [u8;16] future extension
 56      4     payload_len       u32 (incl_len, sliced)
 60      4     orig_payload_len  u32 (orig_len, on-wire)
 ───────────────────────────
 64-byte header + payload verbatim
 ```
 
-- **Triple integrity validation** (Magic → Length → CRC32): any failure drops the dirty tail; no silent bad packets.
+- **v0.4 change (review #2, plan B)**: native IPv6 dropped (16B×2 → 4B×2), the freed 24B stores **real TCP seq/ack/window** — enabling REQ/RESP matching, loss/out-of-order, sliding-window and RTT analysis in Wireshark. IPv6 frames are not recorded.
+- **Quadruple integrity validation** (Magic → Version → Length → CRC32): any failure drops the dirty tail; no silent bad packets. Version mismatch (e.g. stale v0.3 files) is rejected to prevent layout misparse.
 - **TRUNCATED** derived from `orig_payload_len > payload_len`; `sov2pcap` maps `orig_len > incl_len`, and Wireshark shows an accurate snaplen-truncated hint.
 - Fixed 64-byte cache-line alignment; SovVault iterates precisely via `pos += 64 + payload_len`.
 - FastCDC chunk boundaries do **not** align to record boundaries — **SovVault must do streaming byte reassembly**.
@@ -119,7 +124,7 @@ While degraded, new frames are dropped (Drop-Tail), never blocking the ringbuf/k
 - Idle **36 MB RAM** (56% of the 64 MB breaker threshold — always 28 MB headroom); idle CPU **<0.5%** (0.2% measured over 5 s).
 
 ### Blazing-fast unit tests
-- **9 unit tests, all green in 0.03 s**: WAL v0.3 Magic→Length→CRC32 **triple anti-dirty-data validation**, 64 B cache-line alignment, monotonic segment numbers, Unlink-Oldest budget, restart-resume.
+- **37 unit tests, all green in 0.03 s**: WAL v0.4 Magic→Version→Length→CRC32 **quadruple anti-dirty-data validation**, seq/ack/window roundtrip, TCP/UDP × IPv4 boundary slicing, breaker watermark/hysteresis, metrics rendering, sov2pcap synthesize layout, monotonic segment numbers, Unlink-Oldest budget, restart-resume.
 
 ### Real VM E2E (data-driven)
 | Scenario | Result |
@@ -158,7 +163,7 @@ sov2pcap -i /dev/shm/sov-probe/segment_0101.wal -o /tmp/dump.pcap
 sov2pcap -d /dev/shm/sov-probe/ -O /tmp/pcaps/ --filter-port 8080
 ```
 
-Reconstructs 5-tuple / timestamps from the 64 B header, synthesizes Ethernet + IPv4/IPv6 + TCP/UDP headers, and outputs standard PCAP. **Note**: TCP seq/ack are synthesized placeholders and protocol checksums are zeroed (Wireshark recomputes) — suitable for HTTP/API request-semantics analysis; TCP stream reassembly / retransmission analysis awaits Header v0.3 (TCP flags/seq) support.
+Reconstructs 5-tuple / timestamps / **real TCP seq·ack·window** from the 64 B v0.4 header, synthesizes Ethernet + IPv4 + TCP/UDP headers, and outputs standard PCAP (protocol checksums zeroed, Wireshark recomputes). With real seq/ack now stored, Wireshark supports full TCP stream reassembly, **REQ/RESP matching**, retransmission / out-of-order / sliding-window and RTT analysis.
 
 ## Directory layout
 
