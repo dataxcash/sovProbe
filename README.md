@@ -76,5 +76,5 @@ Injection uses the in-kernel `/proc/net/pktgen` (no DPDK); assertions via `:9101
 
 ## License
 
-MIT — the open-source core. The IronCurtain hardware trust layer (KeyD) and enterprise control-plane are proprietary
+AGPL-3.0 — the open-source core. The IronCurtain hardware trust layer (KeyD) and enterprise control-plane are proprietary
 and not included here.
