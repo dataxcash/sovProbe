@@ -271,4 +271,47 @@ mod tests {
         assert_eq!(decoded[0].payload.len(), 64);
         assert_eq!(decoded[0].orig_payload_len, 200);
     }
+
+    /// 用户态热路径吞吐基准（CPU 侧能力，可复现）：slicer 解析 + WAL 编码。
+    /// 不含内核 ringbuf / 通道 / 磁盘写——用于量化单核热路径包速率上限，
+    /// 并作为回归护栏防止后续优化回退。数值随机器波动，只打印不设硬断言。
+    #[test]
+    fn hot_path_userspace_throughput() {
+        let payload = vec![0xAAu8; 512];
+        let frame = tcp_v4_frame(&payload);
+        let slicer = Slicer::new(4096);
+        let n = 300_000u64;
+        let mut scratch = Vec::new();
+        let mut checksum: u64 = 0;
+
+        // 预热：让分配器/CRC 常数表就位
+        for _ in 0..10_000 {
+            if let Some(rec) = slicer.process(&frame, 1, false) {
+                scratch.clear();
+                rec.encode(&mut scratch);
+            }
+        }
+        scratch.clear();
+
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            if let Some(rec) = slicer.process(&frame, i, false) {
+                scratch.clear();
+                rec.encode(&mut scratch);
+                checksum = checksum.wrapping_add(rec.payload.len() as u64);
+            }
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        let pps = n as f64 / dt;
+        eprintln!(
+            "userspace hot path (slicer+encode, 512B payload): {:.0} pps ({:.2} Mpps), {:.2} us/rec",
+            pps,
+            pps / 1e6,
+            dt * 1e6 / n as f64
+        );
+        // 200k pps 是本探针设计压测点；纯用户态热路径应显著高于此，
+        // 否则瓶颈在解析/编码本身（与内核捕获无关）。
+        assert!(pps > 200_000.0, "hot path too slow: {:.0} pps", pps);
+        assert!(checksum > 0);
+    }
 }

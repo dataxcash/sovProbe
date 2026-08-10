@@ -35,6 +35,8 @@ pub struct WalWriter {
     next_rotate: Instant,
     breaker: Breaker,
     queue_watermark: u8,
+    /// 复用编码缓冲：热路径每记录 1 次分配 → 0 次（capacity 保持，clear 复用）
+    scratch: Vec<u8>,
     /// 共享计数（metrics 读取）
     pub written_records: Arc<AtomicU64>,
     pub dropped_records: Arc<AtomicU64>,
@@ -54,6 +56,7 @@ impl WalWriter {
             next_rotate: Instant::now() + params.rotate_interval,
             breaker: params.breaker,
             queue_watermark: params.queue_watermark,
+            scratch: Vec::new(),
             written_records: params.written_records,
             dropped_records: params.dropped_records,
         })
@@ -105,9 +108,12 @@ impl WalWriter {
             self.dropped_records.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let mut buf = Vec::with_capacity(super::header::WAL_HEADER_SIZE + record.payload.len());
-        record.encode(&mut buf);
-        let total = buf.len() as u64;
+        // 复用 scratch 缓冲：clear 不释放 capacity，编码不产生堆分配
+        self.scratch.clear();
+        self.scratch
+            .reserve(super::header::WAL_HEADER_SIZE + record.payload.len());
+        record.encode(&mut self.scratch);
+        let total = self.scratch.len() as u64;
 
         // 超 segment 上限 → 先强制覆盖轮转（Ring-Overwrite），再写新段
         if self.written + total > self.segment_size {
@@ -115,7 +121,7 @@ impl WalWriter {
             self.open_segment()?;
         }
         if let Some(f) = self.file.as_mut() {
-            f.write_all(&buf)?;
+            f.write_all(&self.scratch)?;
             self.written += total;
             self.written_records.fetch_add(1, Ordering::Relaxed);
         }

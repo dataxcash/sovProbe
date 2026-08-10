@@ -124,7 +124,18 @@ While degraded, new frames are dropped (Drop-Tail), never blocking the ringbuf/k
 - Idle **36 MB RAM** (56% of the 64 MB breaker threshold — always 28 MB headroom); idle CPU **<0.5%** (0.2% measured over 5 s).
 
 ### Blazing-fast unit tests
-- **37 unit tests, all green in 0.03 s**: WAL v0.4 Magic→Version→Length→CRC32 **quadruple anti-dirty-data validation**, seq/ack/window roundtrip, TCP/UDP × IPv4 boundary slicing, breaker watermark/hysteresis, metrics rendering, sov2pcap synthesize layout, monotonic segment numbers, Unlink-Oldest budget, restart-resume.
+- **38 unit tests, all green in 0.03 s**: WAL v0.4 Magic→Version→Length→CRC32 **quadruple anti-dirty-data validation**, seq/ack/window roundtrip, TCP/UDP × IPv4 boundary slicing, breaker watermark/hysteresis, metrics rendering, sov2pcap synthesize layout, monotonic segment numbers, Unlink-Oldest budget, restart-resume.
+
+### Userspace hot-path micro-benchmark (CPU-side capacity, reproducible)
+`hot_path_userspace_throughput` 回归护栏：slicer 解析 + WAL 编码紧循环（512B payload，本开发机实测）：
+
+```
+userspace hot path (slicer+encode): 8.63 Mpps (0.12 us/rec)
+```
+
+- 该值**只覆盖纯用户态解析+编码**，不含内核 ringbuf 交付 / 通道 / 磁盘写。
+- 意义：200k pps 压测点下，解析/编码仅占 CPU 的零头（~2.3%），**瓶颈不在计算**，而在捕获交付路径（ringbuf 消费、每帧时间戳、跨线程分配器竞争）。
+- 用 `cargo test --release --lib hot_path_userspace_throughput -- --nocapture` 可随时复测本机数值。
 
 ### Real VM E2E (data-driven)
 | Scenario | Result |
@@ -134,6 +145,8 @@ While degraded, new frames are dropped (Drop-Tail), never blocking the ringbuf/k
 | TC-3a Port-Filter pass-through | 12 M packets to port 5001 @ 200 k pps → **0 captured** (whitelist only sees 8080) |
 | TC-3b Drop-Tail degradation | 12 M packets to port 8080 @ 200 k pps → **3.54 M dropped** per semantics, fail-open never blocks the kernel |
 | TC-3b auto-recovery | load recedes → degraded clears, writes resume, RSS 350 MB → 36 MB via `malloc_trim` |
+
+> **Known reporting gap**: TC-3b 过载场景（200 k pps）下的**进程 CPU 消耗未在 VM 实测**（只测了 idle <0.5%）。复测方法：压测时 `pidstat -p <sovprobe_pid> 1` 或 `perf top` 观察；结合上方用户态微基准（8.63 Mpps），可推定解析/编码非瓶颈，瓶颈应在捕获交付路径。
 
 ### Self-healing dual-layer breaker (verified in TC-3)
 - **Hot path**: queue watermark > 80% → millisecond atomic Drop-Tail.
