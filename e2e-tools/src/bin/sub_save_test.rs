@@ -10,7 +10,8 @@ use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::Parser;
 use slim_common::framing::{
-    decode_chunk_frame, decode_seal_frame, CHUNK_FRAME_HEADER_LEN, ChunkFrame, GapQuery, SealFrame,
+    decode_chunk_batch, decode_chunk_frame, decode_seal_frame, CHUNK_FRAME_HEADER_LEN, ChunkFrame,
+    GapQuery, SealFrame,
 };
 use sov_probe::wal::header::WalRecord;
 use tokio::sync::Mutex;
@@ -302,14 +303,53 @@ impl Reassembler {
     }
 
     fn place(&mut self, frame: ChunkFrame, plaintext: &[u8]) {
+        self.place_raw(frame.dev_id, frame.segment_seq, frame.start_offset, plaintext);
+    }
+
+    /// 按 (dev_id, segment_seq, offset) 幂等落位一个明文 chunk（单个与批量共用）。
+    fn place_raw(&mut self, dev_id: u32, segment_seq: u32, offset: u64, plaintext: &[u8]) {
         self.total_bytes += plaintext.len() as u64;
-        let key = (frame.dev_id, frame.segment_seq);
+        let key = (dev_id, segment_seq);
         let buf = self
             .segments
             .entry(key)
-            .or_insert_with(|| SegmentBuf::open(frame.dev_id, frame.segment_seq, &self.out_dir));
-        buf.place(frame.start_offset, plaintext);
+            .or_insert_with(|| SegmentBuf::open(dev_id, segment_seq, &self.out_dir));
+        buf.place(offset, plaintext);
         self.enforce_pending_budget();
+    }
+
+    /// 处理一个 Chunk 批量帧（批量化）：解出多条 chunk 并逐一解密落位。
+    fn on_batch_frame(&mut self, payload: &[u8], cipher_key: &[u8; 32]) {
+        let Some(batch) = decode_chunk_batch(payload) else {
+            self.unframed_dropped += 1;
+            tracing::warn!("unframed batch dropped");
+            return;
+        };
+        for entry in &batch.entries {
+            self.total_chunks += 1;
+            *self
+                .frames_by_segment
+                .entry((batch.dev_id, batch.segment_seq))
+                .or_insert(0) += 1;
+            let Some(plaintext) = decrypt(cipher_key, entry.payload) else {
+                tracing::warn!(
+                    "decrypt failed / malformed batch entry (seg={} off={})",
+                    batch.segment_seq,
+                    entry.start_offset
+                );
+                continue;
+            };
+            if (plaintext.len() as u32) != entry.chunk_len {
+                tracing::warn!(
+                    "batch chunk len mismatch: header={} actual={} (seg={} off={})",
+                    entry.chunk_len,
+                    plaintext.len(),
+                    batch.segment_seq,
+                    entry.start_offset
+                );
+            }
+            self.place_raw(batch.dev_id, batch.segment_seq, entry.start_offset, &plaintext);
+        }
     }
 
     /// pending 总量超出预算时，逐出全局最旧滞留项（最小 offset），直至回落到预算内。
@@ -552,9 +592,12 @@ async fn main() -> Result<()> {
     let out_dir = PathBuf::from(&cli.out);
 
     // ── 数据订阅 ──
+    // 通道容量从默认 256 扩到 65536：消费端瞬时滞后时不再立刻堵死 zenoh 读线程，
+    // 避免背压传导到发送端使其有界出站队列溢出丢帧（插桩实证的高突发丢帧根因）。
     let sub_reassembler = reassembler.clone();
     let sub = session
         .declare_subscriber(&cli.topic)
+        .with(zenoh::handlers::FifoChannel::new(65536))
         .await
         .map_err(|e| anyhow::anyhow!("declare_subscriber {}: {e}", cli.topic))?;
     tracing::info!("subscribed: {} -> {}", cli.topic, out_dir.display());
@@ -565,6 +608,24 @@ async fn main() -> Result<()> {
             let payload: Vec<u8> = sample.payload().to_bytes().into();
             let mut r = sub_reassembler.lock().await;
             r.on_chunk_frame(&key_expr, payload, &data_key);
+        }
+    });
+
+    // ── Chunk 批量帧订阅（批量化：单段 2.7 万条消息 → 百条级，消除发送端出站队列溢出丢帧）──
+    let batch_reassembler = reassembler.clone();
+    let batch_topic = format!("{}/**", slim_common::topics::BATCH_PREFIX);
+    let batch_sub = session
+        .declare_subscriber(&batch_topic)
+        .with(zenoh::handlers::FifoChannel::new(65536))
+        .await
+        .map_err(|e| anyhow::anyhow!("declare_subscriber {}: {e}", batch_topic))?;
+    tracing::info!("subscribed: {}", batch_topic);
+    let batch_key = key;
+    tokio::spawn(async move {
+        while let Ok(sample) = batch_sub.recv_async().await {
+            let payload: Vec<u8> = sample.payload().to_bytes().into();
+            let mut r = batch_reassembler.lock().await;
+            r.on_batch_frame(&payload, &batch_key);
         }
     });
 
