@@ -10,7 +10,7 @@ use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use clap::Parser;
 use slim_common::framing::{
-    decode_chunk_frame, decode_seal_frame, CHUNK_FRAME_HEADER_LEN, ChunkFrame, SealFrame,
+    decode_chunk_frame, decode_seal_frame, CHUNK_FRAME_HEADER_LEN, ChunkFrame, GapQuery, SealFrame,
 };
 use sov_probe::wal::header::WalRecord;
 use tokio::sync::Mutex;
@@ -340,8 +340,8 @@ impl Reassembler {
         self.segments.values().map(|b| b.pending_bytes).sum()
     }
 
-    /// 处理封盘信号。
-    fn on_seal_frame(&mut self, seal: SealFrame) {
+    /// 处理封盘信号。若该段存在缺失，返回缺口回源请求（调用方据此向发送端查询重发）。
+    fn on_seal_frame(&mut self, seal: SealFrame) -> Option<GapQuery> {
         self.sealed_segments += 1;
         let key = (seal.dev_id, seal.segment_seq);
         match self.segments.get_mut(&key) {
@@ -379,6 +379,14 @@ impl Reassembler {
                     first_pend_off,
                     pend_gap
                 );
+                if missing > 0 && buf.next_expected > 0 {
+                    // 缺口自愈：请求发送端从 next_expected（原 chunk 边界）重发缺失尾部
+                    return Some(GapQuery {
+                        dev_id: seal.dev_id,
+                        segment_seq: seal.segment_seq,
+                        start_offset: buf.next_expected,
+                    });
+                }
             }
             None => {
                 // 从未收到该段任何 Chunk 的封盘信号：仅记账，不落盘空文件
@@ -390,6 +398,7 @@ impl Reassembler {
                 );
             }
         }
+        None
     }
 
     /// 回答 EXISTS 盲去重查询：仅当字节已在本地缓存时才回 "true"。
@@ -423,6 +432,82 @@ impl Reassembler {
         }
         tracing::info!("shutdown: {}", self.stats());
     }
+}
+
+/// 段缺口回源自愈：向发送端 gap 服务查询重发缺失尾部 chunk，重试直至补满或放弃。
+///
+/// 根因（插桩实证）：zenoh 会话内部有界缓冲在突发流量下间歇性丢帧（与去重/切片器/网络
+/// 无关），导致段封盘出现洞。方案：发送端以同一 FastCDC 参数从 `next_expected` 重切片，
+/// 重发缺口 chunk（帧头 (dev,seg,offset) 幂等落位），本函数轮询确认补满后摘除 SegmentBuf。
+async fn refill_segment(
+    session: &zenoh::Session,
+    reassembler: &Arc<Mutex<Reassembler>>,
+    gq: GapQuery,
+    sealed_size: u64,
+) {
+    const MAX_RETRIES: u32 = 4;
+    const VERIFY_TICKS: u64 = 4; // 每轮重发后轮询秒数
+    let key = (gq.dev_id, gq.segment_seq);
+
+    for attempt in 1..=MAX_RETRIES {
+        let req = slim_common::framing::encode_gap_query(&gq);
+        let get = session
+            .get(slim_common::topics::GAPS_PREFIX)
+            .payload(req)
+            .timeout(Duration::from_secs(5));
+        let mut gone = false;
+        let mut resent: u64 = 0;
+        if let Ok(replies) = get.await {
+            for reply in replies {
+                if let Ok(sample) = reply.result() {
+                    let text = sample.payload().to_bytes();
+                    let s = String::from_utf8_lossy(&text);
+                    if let Some(n) = s.strip_prefix("resent=") {
+                        resent = n.parse().unwrap_or(0);
+                    } else if s == "gone" || s == "unknown" {
+                        gone = true;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            "GAP refill attempt {}/{} seg={} off={} resent={} gone={}",
+            attempt,
+            MAX_RETRIES,
+            gq.segment_seq,
+            gq.start_offset,
+            resent,
+            gone
+        );
+        if gone {
+            break;
+        }
+        let mut complete = false;
+        for _ in 0..VERIFY_TICKS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let next = {
+                let r = reassembler.lock().await;
+                r.segments
+                    .get(&key)
+                    .map(|b| b.next_expected)
+                    .unwrap_or(sealed_size)
+            };
+            if next >= sealed_size {
+                complete = true;
+                tracing::info!("GAP refill complete: seg={} got={}", gq.segment_seq, next);
+                break;
+            }
+        }
+        if complete {
+            break;
+        }
+    }
+
+    // 摘除已封盘段（释放文件句柄 + pending 内存）；缺口已由 SEAL 对账上报，文件保留在盘
+    let mut r = reassembler.lock().await;
+    r.segments.remove(&key);
+    r.frames_by_segment.remove(&key);
+    tracing::info!("GAP refill done (final): seg={} map_segments={}", gq.segment_seq, r.segments.len());
 }
 
 fn decrypt(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
@@ -485,6 +570,7 @@ async fn main() -> Result<()> {
 
     // ── 封盘信号订阅 ──
     let seal_reassembler = reassembler.clone();
+    let seal_session = session.clone();
     let seal_sub = session
         .declare_subscriber(&cli.seal_topic)
         .await
@@ -494,8 +580,14 @@ async fn main() -> Result<()> {
         while let Ok(sample) = seal_sub.recv_async().await {
             let payload: Vec<u8> = sample.payload().to_bytes().into();
             if let Some(seal) = decode_seal_frame(&payload) {
-                let mut r = seal_reassembler.lock().await;
-                r.on_seal_frame(seal);
+                let gap_req = {
+                    let mut r = seal_reassembler.lock().await;
+                    r.on_seal_frame(seal)
+                };
+                // 缺口自愈：封盘发现缺失 → 向发送端查询重发，补满后摘除段缓冲
+                if let Some(gq) = gap_req {
+                    refill_segment(&seal_session, &seal_reassembler, gq, seal.sealed_size).await;
+                }
             }
         }
     });
