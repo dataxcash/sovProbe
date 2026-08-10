@@ -54,7 +54,13 @@ grep -E "STAT|SEAL" /var/log/sub_save_test.log | tail -3
 say "TC-3 高 pps 注入（$TC3_MODE）"
 case "$TC3_MODE" in
   --tc3-pktgen)
-    sudo pktgen -i "$NIC" -m 200000 -d "$VM1_IP" -t 60
+    # 轻量方案：内核 /proc/net/pktgen（零安装，替代 DPDK，见 docs §9.7）。
+    # pktgen 接管 $NIC 会短暂断连 VM-2 的 SSH；脚本 count*delay 有界自终止后自动释放。
+    sudo modprobe pktgen
+    # TC-3a：非目标端口 → Port-Filter 放行断言
+    sudo bash "$HERE/pktgen_tc3.sh" 5001 12000000 5000
+    # TC-3b：目标端口 8080 → Drop-Tail 降级 + 负载回落后自动恢复断言
+    sudo bash "$HERE/pktgen_tc3.sh" 8080 12000000 5000
     ;;
   --tc3-netem)
     # 降级方案：多实例 sockperf 聚合 + tc 突发（无 DPDK 时）
