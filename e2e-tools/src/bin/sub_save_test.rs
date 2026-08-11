@@ -789,7 +789,7 @@ mod tests {
     /// 封盘三重校验对账：完整 WAL 段 → records 数正确、residual=0。
     #[test]
     fn seal_counts_records() {
-        use sov_probe::wal::header::{encode_ip, WalRecord, TCP_ACK};
+        use sov_probe::wal::header::{WalRecord, TCP_ACK};
         let dir = tmp_out("records");
         let mut r = Reassembler::new(dir.clone());
         let mut wal = Vec::new();
@@ -798,8 +798,11 @@ mod tests {
                 timestamp_ns: 1_700_000_000_000 + i as u64,
                 flags: 0,
                 tcp_flags: TCP_ACK,
-                src_ip: encode_ip(Some([10, 0, 0, 1]), None).0,
-                dst_ip: encode_ip(Some([10, 0, 0, 2]), None).0,
+                tcp_seq: 1000 + i,
+                tcp_ack: 0,
+                window_size: 65535,
+                src_ip: [10, 0, 0, 1],
+                dst_ip: [10, 0, 0, 2],
                 src_port: 1000,
                 dst_port: 8080,
                 proto: 6,

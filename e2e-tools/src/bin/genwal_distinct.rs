@@ -1,4 +1,4 @@
-use sov_probe::wal::header::{encode_ip, WalRecord};
+use sov_probe::wal::header::WalRecord;
 
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: genwal_distinct <dir>");
@@ -15,8 +15,11 @@ fn main() {
             timestamp_ns: 1_700_000_000_000 + segno * 1000 + i as u64,
             flags: 0,
             tcp_flags: 0x10,
-            src_ip: encode_ip(Some([10, 0, 0, segno as u8]), None).0,
-            dst_ip: encode_ip(Some([10, 0, 1, 1]), None).0,
+            tcp_seq: 1000 + i,
+            tcp_ack: 0,
+            window_size: 65535,
+            src_ip: [10, 0, 0, segno as u8],
+            dst_ip: [10, 0, 1, 1],
             src_port: 10000 + segno as u16,
             dst_port: 8080,
             proto: 6,
