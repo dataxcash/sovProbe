@@ -149,3 +149,86 @@ impl WalWriter {
         self.flush()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::slicer::Slicer;
+    use crossbeam_channel::bounded;
+
+    /// 合成 TCP/IPv4 帧（512B payload）。
+    fn tcp_v4_frame() -> Vec<u8> {
+        let payload = vec![0xAAu8; 512];
+        let mut buf = Vec::new();
+        etherparse::PacketBuilder::ethernet2(
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+        )
+        .ipv4([192, 168, 1, 10], [10, 0, 0, 1], 64)
+        .tcp(12345, 443, 100, 65535)
+        .syn()
+        .write(&mut buf, &payload)
+        .unwrap();
+        buf
+    }
+
+    /// 全链路用户态吞吐基准：Slicer → bounded channel → WalWriter（真实写 tmpfs）。
+    ///
+    /// 与 hot_path_userspace_throughput（仅 parse+encode）对照：
+    /// - 若本值接近上者 → 通道/写盘不是瓶颈，瓶颈在 aya ringbuf 消费（内核侧）；
+    /// - 若本值显著更低 → 瓶颈在 channel/WalWriter 交付路径，可继续内省。
+    ///
+    /// 输出 pps 只打印不硬断言（防机器间抖动）。
+    #[test]
+    fn full_pipeline_throughput_bench() {
+        const N: u64 = 200_000;
+        let dir = std::env::temp_dir().join(format!("sovprobe_pipe_bench_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let breaker = Breaker::new();
+        let written = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = bounded::<WalRecord>(1_000_000); // 容量 >> N，基准期间永不触及水位
+        let rx = Arc::new(rx);
+
+        let mut writer = WalWriter::new(WriterParams {
+            shm_path: dir.to_string_lossy().into_owned(),
+            max_segments: 8,
+            segment_size: 256 * 1024 * 1024,
+            rotate_interval: Duration::from_secs(3600),
+            breaker: breaker.clone(),
+            queue_watermark: 100, // 基准测满速，禁用降级丢帧
+            written_records: written.clone(),
+            dropped_records: dropped.clone(),
+        })
+        .unwrap();
+
+        let frame = tcp_v4_frame();
+        let slicer = Slicer::new(4096);
+        let producer = std::thread::spawn(move || {
+            for i in 0..N {
+                if let Some(rec) = slicer.process(&frame, i, false) {
+                    if tx.send(rec).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let t0 = Instant::now();
+        writer.run(&rx).unwrap();
+        let dt = t0.elapsed().as_secs_f64();
+        producer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let n_written = written.load(Ordering::Relaxed);
+        let n_dropped = dropped.load(Ordering::Relaxed);
+        let pps = n_written as f64 / dt;
+        eprintln!(
+            "full pipeline (slicer→channel→wal tmpfs, 512B): {:.0} pps ({:.2} Mpps), {} written / {} dropped in {:.2}s",
+            pps, pps / 1e6, n_written, n_dropped, dt
+        );
+        // 全链路应明显高于 200k 压测点；否则瓶颈就在交付路径
+        assert!(n_written > 0, "writer 未写入任何记录");
+    }
+}

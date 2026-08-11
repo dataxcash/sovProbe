@@ -82,16 +82,17 @@ int sovprobe_classify(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    void *buf = bpf_ringbuf_reserve(&events, MAX_COPY, 0);
+    __u32 copy_len = skb->len < MAX_COPY ? skb->len : MAX_COPY;
+    if (copy_len == 0) {
+        return TC_ACT_OK;
+    }
+    // 按实际帧长预留（而非固定 MAX_COPY）：1MB ringbuf 容量按帧长等效放大
+    // 3~46 倍，高 pps 下显著减少内核侧 ring 满丢包与消费唤醒
+    void *buf = bpf_ringbuf_reserve(&events, copy_len, 0);
     if (!buf) {
         return TC_ACT_OK; // ringbuf 满 → 静默丢包，fail-open
     }
 
-    __u32 copy_len = skb->len < MAX_COPY ? skb->len : MAX_COPY;
-    if (copy_len == 0) {
-        bpf_ringbuf_discard(buf, 0);
-        return TC_ACT_OK;
-    }
     if (bpf_skb_load_bytes(skb, 0, buf, copy_len) == 0) {
         bpf_ringbuf_submit(buf, 0);
     } else {
